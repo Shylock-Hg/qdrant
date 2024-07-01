@@ -4,11 +4,12 @@ use async_trait::async_trait;
 use common::defaults::{self, CONSENSUS_CONFIRM_RETRIES};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::time::{sleep, sleep_until, timeout_at};
+use tokio::time::sleep;
 
 use super::channel_service::ChannelService;
 use super::remote_shard::RemoteShard;
 use super::replica_set::ReplicaState;
+use super::resharding::ReshardKey;
 use super::shard::{PeerId, ShardId};
 use super::CollectionId;
 use crate::operations::types::{CollectionError, CollectionResult};
@@ -30,6 +31,11 @@ const CONSENSUS_CONFIRM_TIMEOUT: Duration = defaults::CONSENSUS_META_OP_WAIT;
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ShardTransfer {
     pub shard_id: ShardId,
+    /// For resharding, a different target shard ID may be configured
+    /// By default the shard ID on the target peer is the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)] // TODO(resharding): expose once we release resharding
+    pub to_shard_id: Option<ShardId>,
     pub from: PeerId,
     pub to: PeerId,
     /// If this flag is true, this is a replication related transfer of shard from 1 peer to another
@@ -38,16 +44,13 @@ pub struct ShardTransfer {
     /// Method to transfer shard with. `None` to choose automatically.
     #[serde(default)]
     pub method: Option<ShardTransferMethod>,
-    /// For resharding, a different target shard ID may be configured
-    /// By default the shard ID on the target peer is the same.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub to_shard_id: Option<ShardId>,
 }
 
 impl ShardTransfer {
     pub fn key(&self) -> ShardTransferKey {
         ShardTransferKey {
             shard_id: self.shard_id,
+            to_shard_id: self.to_shard_id,
             from: self.from,
             to: self.to,
         }
@@ -57,6 +60,9 @@ impl ShardTransfer {
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ShardTransferRestart {
     pub shard_id: ShardId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)] // TODO(resharding): expose once we release resharding
+    pub to_shard_id: Option<ShardId>,
     pub from: PeerId,
     pub to: PeerId,
     pub method: ShardTransferMethod,
@@ -66,6 +72,7 @@ impl ShardTransferRestart {
     pub fn key(&self) -> ShardTransferKey {
         ShardTransferKey {
             shard_id: self.shard_id,
+            to_shard_id: self.to_shard_id,
             from: self.from,
             to: self.to,
         }
@@ -76,6 +83,7 @@ impl From<ShardTransfer> for ShardTransferRestart {
     fn from(transfer: ShardTransfer) -> Self {
         Self {
             shard_id: transfer.shard_id,
+            to_shard_id: transfer.to_shard_id,
             from: transfer.from,
             to: transfer.to,
             method: transfer.method.unwrap_or_default(),
@@ -87,6 +95,9 @@ impl From<ShardTransfer> for ShardTransferRestart {
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ShardTransferKey {
     pub shard_id: ShardId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)] // TODO(resharding): expose once we release resharding
+    pub to_shard_id: Option<ShardId>,
     pub from: PeerId,
     pub to: PeerId,
 }
@@ -110,9 +121,14 @@ pub enum ShardTransferMethod {
     WalDelta,
     /// Shard transfer for resharding: stream all records in batches until all points are
     /// transferred.
-    #[doc(hidden)]
-    #[schemars(skip)]
+    #[schemars(skip)] // TODO(resharding): expose once we release resharding
     ReshardingStreamRecords,
+}
+
+impl ShardTransferMethod {
+    pub fn is_resharding(&self) -> bool {
+        matches!(self, Self::ReshardingStreamRecords)
+    }
 }
 
 /// Interface to consensus for shard transfer operations.
@@ -223,7 +239,7 @@ pub trait ShardTransferConsensus: Send + Sync {
     async fn start_shard_transfer(
         &self,
         transfer_config: ShardTransfer,
-        collection_name: CollectionId,
+        collection_id: CollectionId,
     ) -> CollectionResult<()>;
 
     /// Propose to start a shard transfer
@@ -233,7 +249,7 @@ pub trait ShardTransferConsensus: Send + Sync {
     async fn start_shard_transfer_confirm_and_retry(
         &self,
         transfer_config: &ShardTransfer,
-        collection_name: &str,
+        collection_id: &str,
     ) -> CollectionResult<()> {
         let mut result = Err(CollectionError::service_error(
             "`start_shard_transfer_confirm_and_retry` exit without attempting any work, \
@@ -247,7 +263,7 @@ pub trait ShardTransferConsensus: Send + Sync {
 
             log::trace!("Propose and confirm shard transfer start operation");
             result = self
-                .start_shard_transfer(transfer_config.clone(), collection_name.into())
+                .start_shard_transfer(transfer_config.clone(), collection_id.into())
                 .await;
 
             match &result {
@@ -381,6 +397,175 @@ pub trait ShardTransferConsensus: Send + Sync {
         })
     }
 
+    /// Set the shard replica state on this peer through consensus
+    ///
+    /// # Warning
+    ///
+    /// This only submits a proposal to consensus. Calling this does not guarantee that consensus
+    /// will actually apply the operation across the cluster.
+    async fn set_shard_replica_set_state(
+        &self,
+        collection_id: CollectionId,
+        shard_id: ShardId,
+        state: ReplicaState,
+        from_state: Option<ReplicaState>,
+    ) -> CollectionResult<()>;
+
+    /// Propose to set the shard replica state on this peer through consensus
+    ///
+    /// This internally confirms and retries a few times if needed to ensure consensus picks up the
+    /// operation.
+    async fn set_shard_replica_set_state_confirm_and_retry(
+        &self,
+        collection_id: &CollectionId,
+        shard_id: ShardId,
+        state: ReplicaState,
+        from_state: Option<ReplicaState>,
+    ) -> CollectionResult<()> {
+        let mut result = Err(CollectionError::service_error(
+            "`set_shard_replica_set_state_confirm_and_retry` exit without attempting any work, \
+             this is a programming error",
+        ));
+
+        for attempt in 0..CONSENSUS_CONFIRM_RETRIES {
+            if attempt > 0 {
+                sleep(CONSENSUS_CONFIRM_RETRY_DELAY).await;
+            }
+
+            log::trace!("Propose and confirm set shard replica set state");
+            result = self
+                .set_shard_replica_set_state(collection_id.clone(), shard_id, state, from_state)
+                .await;
+
+            match &result {
+                Ok(()) => break,
+                Err(err) => {
+                    log::error!(
+                        "Failed to confirm set shard replica set state operation on consensus: {err}"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        result.map_err(|err| {
+            CollectionError::service_error(format!(
+                "Failed to set shard replica set state through consensus \
+                 after {CONSENSUS_CONFIRM_RETRIES} retries: {err}"
+            ))
+        })
+    }
+
+    /// Propose to commit the read hash ring.
+    ///
+    /// # Warning
+    ///
+    /// This only submits a proposal to consensus. Calling this does not guarantee that consensus
+    /// will actually apply the operation across the cluster.
+    async fn commit_read_hashring(
+        &self,
+        collection_id: CollectionId,
+        reshard_key: ReshardKey,
+    ) -> CollectionResult<()>;
+
+    /// Propose to commit the read hash ring, then confirm or retry.
+    ///
+    /// This internally confirms and retries a few times if needed to ensure consensus picks up the
+    /// operation.
+    async fn commit_read_hashring_confirm_and_retry(
+        &self,
+        collection_id: &CollectionId,
+        reshard_key: &ReshardKey,
+    ) -> CollectionResult<()> {
+        let mut result = Err(CollectionError::service_error(
+            "`commit_read_hashring_confirm_and_retry` exit without attempting any work, \
+             this is a programming error",
+        ));
+
+        for attempt in 0..CONSENSUS_CONFIRM_RETRIES {
+            if attempt > 0 {
+                sleep(CONSENSUS_CONFIRM_RETRY_DELAY).await;
+            }
+
+            log::trace!("Propose and confirm commit read hashring operation");
+            result = self
+                .commit_read_hashring(collection_id.into(), reshard_key.clone())
+                .await;
+
+            match &result {
+                Ok(()) => break,
+                Err(err) => {
+                    log::error!(
+                        "Failed to confirm commit read hashring operation on consensus: {err}"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        result.map_err(|err| {
+            CollectionError::service_error(format!(
+                "Failed to commit read hashring through consensus \
+                 after {CONSENSUS_CONFIRM_RETRIES} retries: {err}"
+            ))
+        })
+    }
+
+    /// Propose to commit the write hash ring.
+    ///
+    /// # Warning
+    ///
+    /// This only submits a proposal to consensus. Calling this does not guarantee that consensus
+    /// will actually apply the operation across the cluster.
+    async fn commit_write_hashring(
+        &self,
+        collection_id: CollectionId,
+        reshard_key: ReshardKey,
+    ) -> CollectionResult<()>;
+
+    /// Propose to commit the write hash ring, then confirm or retry.
+    ///
+    /// This internally confirms and retries a few times if needed to ensure consensus picks up the
+    /// operation.
+    async fn commit_write_hashring_confirm_and_retry(
+        &self,
+        collection_id: &CollectionId,
+        reshard_key: &ReshardKey,
+    ) -> CollectionResult<()> {
+        let mut result = Err(CollectionError::service_error(
+            "`commit_write_hashring_confirm_and_retry` exit without attempting any work, \
+             this is a programming error",
+        ));
+
+        for attempt in 0..CONSENSUS_CONFIRM_RETRIES {
+            if attempt > 0 {
+                sleep(CONSENSUS_CONFIRM_RETRY_DELAY).await;
+            }
+
+            log::trace!("Propose and confirm commit write hashring operation");
+            result = self
+                .commit_write_hashring(collection_id.into(), reshard_key.clone())
+                .await;
+
+            match &result {
+                Ok(()) => break,
+                Err(err) => {
+                    log::error!(
+                        "Failed to confirm commit write hashring operation on consensus: {err}"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        result.map_err(|err| {
+            CollectionError::service_error(format!(
+                "Failed to commit write hashring through consensus \
+                 after {CONSENSUS_CONFIRM_RETRIES} retries: {err}"
+            ))
+        })
+    }
+
     /// Wait for all other peers to reach the current consensus
     ///
     /// This will take the current consensus state of this node. It then explicitly awaits on all
@@ -396,11 +581,7 @@ pub trait ShardTransferConsensus: Send + Sync {
     /// # Cancel safety
     ///
     /// This method is cancel safe.
-    async fn await_consensus_sync(
-        &self,
-        this_peer_id: PeerId,
-        channel_service: &ChannelService,
-    ) -> CollectionResult<()> {
+    async fn await_consensus_sync(&self, channel_service: &ChannelService) -> CollectionResult<()> {
         let other_peer_count = channel_service.id_to_address.read().len().saturating_sub(1);
         if other_peer_count == 0 {
             log::warn!("There are no other peers, skipped synchronizing consensus");
@@ -412,46 +593,12 @@ pub trait ShardTransferConsensus: Send + Sync {
             "Waiting on {other_peer_count} peer(s) to reach consensus (commit: {commit}, term: {term}) before finalizing shard transfer"
         );
         channel_service
-            .await_commit_on_all_peers(this_peer_id, commit, term, defaults::CONSENSUS_META_OP_WAIT)
+            .await_commit_on_all_peers(
+                self.this_peer_id(),
+                commit,
+                term,
+                defaults::CONSENSUS_META_OP_WAIT,
+            )
             .await
-    }
-}
-
-/// Await for consensus to synchronize across all peers
-///
-/// This will take the current consensus state of this node. It then explicitly waits on all other
-/// nodes to reach the same (or later) consensus.
-///
-/// If awaiting on other nodes fails for any reason, this simply continues after the consensus
-/// timeout.
-///
-/// # Cancel safety
-///
-/// This function is cancel safe.
-async fn await_consensus_sync(
-    consensus: &dyn ShardTransferConsensus,
-    channel_service: &ChannelService,
-    this_peer_id: PeerId,
-) {
-    let wait_until = tokio::time::Instant::now() + defaults::CONSENSUS_META_OP_WAIT;
-    let sync_consensus = timeout_at(
-        wait_until,
-        consensus.await_consensus_sync(this_peer_id, channel_service),
-    )
-    .await;
-
-    match sync_consensus {
-        Ok(Ok(_)) => log::trace!("All peers reached consensus"),
-        // Failed to sync explicitly, waiting until timeout to assume synchronization
-        Ok(Err(err)) => {
-            log::warn!("All peers failed to synchronize consensus, waiting until timeout: {err}");
-            sleep_until(wait_until).await;
-        }
-        // Reached timeout, assume consensus is synchronized
-        Err(err) => {
-            log::warn!(
-                "All peers failed to synchronize consensus, continuing after timeout: {err}"
-            );
-        }
     }
 }

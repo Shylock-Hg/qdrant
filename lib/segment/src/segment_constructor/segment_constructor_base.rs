@@ -6,6 +6,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use atomic_refcell::AtomicRefCell;
+use common::cpu::CpuPermit;
 use io::storage_version::StorageVersion;
 use log::info;
 use parking_lot::{Mutex, RwLock};
@@ -18,11 +19,12 @@ use crate::common::rocksdb_wrapper::{open_db, DB_VECTOR_CF};
 use crate::data_types::vectors::DEFAULT_VECTOR_NAME;
 use crate::id_tracker::simple_id_tracker::SimpleIdTracker;
 use crate::id_tracker::{IdTracker, IdTrackerEnum, IdTrackerSS};
-use crate::index::hnsw_index::graph_links::{GraphLinksMmap, GraphLinksRam};
-use crate::index::hnsw_index::hnsw::HNSWIndex;
+use crate::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
 use crate::index::plain_payload_index::PlainIndex;
 use crate::index::sparse_index::sparse_index_config::SparseIndexType;
-use crate::index::sparse_index::sparse_vector_index::SparseVectorIndex;
+use crate::index::sparse_index::sparse_vector_index::{
+    self, SparseVectorIndex, SparseVectorIndexOpenArgs,
+};
 use crate::index::struct_payload_index::StructPayloadIndex;
 use crate::index::VectorIndexEnum;
 use crate::payload_storage::on_disk_payload_storage::OnDiskPayloadStorage;
@@ -31,7 +33,7 @@ use crate::payload_storage::simple_payload_storage::SimplePayloadStorage;
 use crate::segment::{Segment, SegmentVersion, VectorData, SEGMENT_STATE_FILE};
 use crate::types::{
     Distance, Indexes, PayloadStorageType, SegmentConfig, SegmentState, SegmentType, SeqNumberType,
-    SparseVectorDataConfig, VectorDataConfig, VectorStorageDatatype, VectorStorageType,
+    VectorDataConfig, VectorStorageDatatype, VectorStorageType,
 };
 use crate::vector_storage::dense::appendable_mmap_dense_vector_storage::{
     open_appendable_memmap_vector_storage, open_appendable_memmap_vector_storage_byte,
@@ -97,7 +99,7 @@ pub(crate) fn open_vector_storage(
         VectorStorageType::Memory => {
             let db_column_name = get_vector_name_with_prefix(DB_VECTOR_CF, vector_name);
 
-            if let Some(multi_vec_config) = &vector_config.multivec_config {
+            if let Some(multi_vec_config) = &vector_config.multivector_config {
                 match storage_element_type {
                     VectorStorageDatatype::Float32 => open_simple_multi_dense_vector_storage(
                         database.clone(),
@@ -152,7 +154,7 @@ pub(crate) fn open_vector_storage(
         }
         // Mmap on disk, not appendable
         VectorStorageType::Mmap => {
-            if let Some(multi_vec_config) = &vector_config.multivec_config {
+            if let Some(multi_vec_config) = &vector_config.multivector_config {
                 // there are no mmap multi vector storages, appendable only
                 match storage_element_type {
                     VectorStorageDatatype::Float32 => open_appendable_memmap_multi_vector_storage(
@@ -200,7 +202,7 @@ pub(crate) fn open_vector_storage(
         }
         // Chunked mmap on disk, appendable
         VectorStorageType::ChunkedMmap => {
-            if let Some(multi_vec_config) = &vector_config.multivec_config {
+            if let Some(multi_vec_config) = &vector_config.multivector_config {
                 match storage_element_type {
                     VectorStorageDatatype::Float32 => open_appendable_memmap_multi_vector_storage(
                         vector_storage_path,
@@ -292,6 +294,7 @@ pub(crate) fn get_payload_index_path(segment_path: &Path) -> PathBuf {
     segment_path.join(PAYLOAD_INDEX_PATH)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn create_vector_index(
     vector_config: &VectorDataConfig,
     vector_index_path: &Path,
@@ -299,6 +302,8 @@ pub(crate) fn create_vector_index(
     vector_storage: Arc<AtomicRefCell<VectorStorageEnum>>,
     payload_index: Arc<AtomicRefCell<StructPayloadIndex>>,
     quantized_vectors: Arc<AtomicRefCell<Option<QuantizedVectors>>>,
+    permit: Option<Arc<CpuPermit>>,
+    stopped: &AtomicBool,
 ) -> OperationResult<VectorIndexEnum> {
     let vector_index = match &vector_config.index {
         Indexes::Plain {} => VectorIndexEnum::Plain(PlainIndex::new(
@@ -307,24 +312,20 @@ pub(crate) fn create_vector_index(
             payload_index.clone(),
         )),
         Indexes::Hnsw(vector_hnsw_config) => {
+            let args = HnswIndexOpenArgs {
+                path: vector_index_path,
+                id_tracker: id_tracker.clone(),
+                vector_storage: vector_storage.clone(),
+                quantized_vectors: quantized_vectors.clone(),
+                payload_index: payload_index.clone(),
+                hnsw_config: vector_hnsw_config.clone(),
+                permit,
+                stopped,
+            };
             if vector_hnsw_config.on_disk == Some(true) {
-                VectorIndexEnum::HnswMmap(HNSWIndex::<GraphLinksMmap>::open(
-                    vector_index_path,
-                    id_tracker.clone(),
-                    vector_storage.clone(),
-                    quantized_vectors.clone(),
-                    payload_index.clone(),
-                    vector_hnsw_config.clone(),
-                )?)
+                VectorIndexEnum::HnswMmap(HNSWIndex::open(args)?)
             } else {
-                VectorIndexEnum::HnswRam(HNSWIndex::<GraphLinksRam>::open(
-                    vector_index_path,
-                    id_tracker.clone(),
-                    vector_storage.clone(),
-                    quantized_vectors.clone(),
-                    payload_index.clone(),
-                    vector_hnsw_config.clone(),
-                )?)
+                VectorIndexEnum::HnswRam(HNSWIndex::open(args)?)
             }
         }
     };
@@ -332,41 +333,58 @@ pub(crate) fn create_vector_index(
     Ok(vector_index)
 }
 
-pub(crate) fn create_sparse_vector_index(
-    sparse_vector_config: SparseVectorDataConfig,
-    vector_index_path: &Path,
-    id_tracker: Arc<AtomicRefCell<IdTrackerSS>>,
-    vector_storage: Arc<AtomicRefCell<VectorStorageEnum>>,
-    payload_index: Arc<AtomicRefCell<StructPayloadIndex>>,
-    stopped: &AtomicBool,
+#[cfg(feature = "testing")]
+pub fn create_sparse_vector_index_test(
+    args: SparseVectorIndexOpenArgs<impl FnMut()>,
 ) -> OperationResult<VectorIndexEnum> {
-    let vector_index = match sparse_vector_config.index.index_type {
-        SparseIndexType::MutableRam => VectorIndexEnum::SparseRam(SparseVectorIndex::open(
-            sparse_vector_config.index,
-            id_tracker.clone(),
-            vector_storage.clone(),
-            payload_index.clone(),
-            vector_index_path,
-            stopped,
-        )?),
-        SparseIndexType::ImmutableRam => {
-            VectorIndexEnum::SparseImmutableRam(SparseVectorIndex::open(
-                sparse_vector_config.index,
-                id_tracker.clone(),
-                vector_storage.clone(),
-                payload_index.clone(),
-                vector_index_path,
-                stopped,
-            )?)
+    create_sparse_vector_index(args)
+}
+
+pub(crate) fn create_sparse_vector_index(
+    args: SparseVectorIndexOpenArgs<impl FnMut()>,
+) -> OperationResult<VectorIndexEnum> {
+    let vector_index = match (
+        args.config.index_type,
+        args.config.datatype.unwrap_or_default(),
+        sparse_vector_index::USE_COMPRESSED,
+    ) {
+        (_, a @ (VectorStorageDatatype::Float16 | VectorStorageDatatype::Uint8), false) => {
+            Err(OperationError::ValidationError {
+                description: format!("{:?} datatype is not supported", a),
+            })?
         }
-        SparseIndexType::Mmap => VectorIndexEnum::SparseMmap(SparseVectorIndex::open(
-            sparse_vector_config.index,
-            id_tracker.clone(),
-            vector_storage.clone(),
-            payload_index.clone(),
-            vector_index_path,
-            stopped,
-        )?),
+
+        (SparseIndexType::MutableRam, _, _) => {
+            VectorIndexEnum::SparseRam(SparseVectorIndex::open(args)?)
+        }
+
+        // Non-compressed
+        (SparseIndexType::ImmutableRam, VectorStorageDatatype::Float32, false) => {
+            VectorIndexEnum::SparseImmutableRam(SparseVectorIndex::open(args)?)
+        }
+        (SparseIndexType::Mmap, VectorStorageDatatype::Float32, false) => {
+            VectorIndexEnum::SparseMmap(SparseVectorIndex::open(args)?)
+        }
+
+        // Compressed
+        (SparseIndexType::ImmutableRam, VectorStorageDatatype::Float32, true) => {
+            VectorIndexEnum::SparseCompressedImmutableRamF32(SparseVectorIndex::open(args)?)
+        }
+        (SparseIndexType::Mmap, VectorStorageDatatype::Float32, true) => {
+            VectorIndexEnum::SparseCompressedMmapF32(SparseVectorIndex::open(args)?)
+        }
+        (SparseIndexType::ImmutableRam, VectorStorageDatatype::Float16, true) => {
+            VectorIndexEnum::SparseCompressedImmutableRamF16(SparseVectorIndex::open(args)?)
+        }
+        (SparseIndexType::Mmap, VectorStorageDatatype::Float16, true) => {
+            VectorIndexEnum::SparseCompressedMmapF16(SparseVectorIndex::open(args)?)
+        }
+        (SparseIndexType::ImmutableRam, VectorStorageDatatype::Uint8, true) => {
+            VectorIndexEnum::SparseCompressedImmutableRamU8(SparseVectorIndex::open(args)?)
+        }
+        (SparseIndexType::Mmap, VectorStorageDatatype::Uint8, true) => {
+            VectorIndexEnum::SparseCompressedMmapU8(SparseVectorIndex::open(args)?)
+        }
     };
 
     Ok(vector_index)
@@ -446,6 +464,8 @@ fn create_segment(
             vector_storage.clone(),
             payload_index.clone(),
             quantized_vectors.clone(),
+            None,
+            stopped,
         )?);
 
         check_process_stopped(stopped)?;
@@ -480,14 +500,15 @@ fn create_segment(
             );
         }
 
-        let vector_index = sp(create_sparse_vector_index(
-            sparse_vector_config.clone(),
-            &vector_index_path,
-            id_tracker.clone(),
-            vector_storage.clone(),
-            payload_index.clone(),
+        let vector_index = sp(create_sparse_vector_index(SparseVectorIndexOpenArgs {
+            config: sparse_vector_config.index,
+            id_tracker: id_tracker.clone(),
+            vector_storage: vector_storage.clone(),
+            payload_index: payload_index.clone(),
+            path: &vector_index_path,
             stopped,
-        )?);
+            tick_progress: || (),
+        })?);
 
         check_process_stopped(stopped)?;
 

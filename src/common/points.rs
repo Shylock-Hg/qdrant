@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use api::rest::ShardKeySelector;
+use api::rest::{SearchGroupsRequestInternal, ShardKeySelector};
 use collection::common::batching::batch_requests;
 use collection::operations::consistency_params::ReadConsistency;
 use collection::operations::payload_ops::{
@@ -15,9 +15,9 @@ use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::types::{
     CoreSearchRequest, CoreSearchRequestBatch, CountRequestInternal, CountResult,
     DiscoverRequestBatch, DiscoverRequestInternal, GroupsResult, PointRequestInternal,
-    RecommendGroupsRequestInternal, Record, ScrollRequestInternal, ScrollResult,
-    SearchGroupsRequestInternal, UpdateResult,
+    RecommendGroupsRequestInternal, Record, ScrollRequestInternal, ScrollResult, UpdateResult,
 };
+use collection::operations::universal_query::collection_query::CollectionQueryRequest;
 use collection::operations::vector_ops::{
     DeleteVectors, UpdateVectors, UpdateVectorsOp, VectorOperations,
 };
@@ -979,4 +979,35 @@ pub async fn do_scroll_points(
         access,
     )
     .await
+}
+
+pub async fn do_query_points(
+    toc: &TableOfContent,
+    collection_name: &str,
+    request: CollectionQueryRequest,
+    read_consistency: Option<ReadConsistency>,
+    shard_selection: ShardSelectorInternal,
+    access: Access,
+    timeout: Option<Duration>,
+) -> Result<Vec<ScoredPoint>, StorageError> {
+    let requests = vec![(request, shard_selection)];
+    let batch_res = toc
+        .query_batch(collection_name, requests, read_consistency, access, timeout)
+        .await?;
+    batch_res
+        .into_iter()
+        .next()
+        .ok_or_else(|| StorageError::service_error("Empty query result"))
+}
+
+pub async fn do_query_batch_points(
+    toc: &TableOfContent,
+    collection_name: &str,
+    requests: Vec<(CollectionQueryRequest, ShardSelectorInternal)>,
+    read_consistency: Option<ReadConsistency>,
+    access: Access,
+    timeout: Option<Duration>,
+) -> Result<Vec<Vec<ScoredPoint>>, StorageError> {
+    toc.query_batch(collection_name, requests, read_consistency, access, timeout)
+        .await
 }

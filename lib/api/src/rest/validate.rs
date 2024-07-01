@@ -11,7 +11,8 @@ impl Validate for VectorStruct {
     fn validate(&self) -> Result<(), validator::ValidationErrors> {
         match self {
             VectorStruct::Single(_) => Ok(()),
-            VectorStruct::Multi(v) => common::validation::validate_iter(v.values()),
+            VectorStruct::MultiDense(v) => validate_multi_vector(v),
+            VectorStruct::Named(v) => common::validation::validate_iter(v.values()),
         }
     }
 }
@@ -20,7 +21,13 @@ impl Validate for BatchVectorStruct {
     fn validate(&self) -> Result<(), validator::ValidationErrors> {
         match self {
             BatchVectorStruct::Single(_) => Ok(()),
-            BatchVectorStruct::Multi(v) => {
+            BatchVectorStruct::MultiDense(vectors) => {
+                for vector in vectors {
+                    common::validation::validate_multi_vector(vector)?;
+                }
+                Ok(())
+            }
+            BatchVectorStruct::Named(v) => {
                 common::validation::validate_iter(v.values().flat_map(|batch| batch.iter()))
             }
         }
@@ -59,12 +66,12 @@ impl Validate for QueryInterface {
 impl Validate for Query {
     fn validate(&self) -> Result<(), validator::ValidationErrors> {
         match self {
-            Query::Nearest(vector) => vector.validate(),
-            Query::Recommend(recommend) => recommend.validate(),
-            Query::Discover(discover) => discover.validate(),
-            Query::Context(context) => context.validate(),
-            Query::Fusion(fusion) => fusion.validate(),
-            Query::OrderBy(order_by) => order_by.validate(),
+            Query::Nearest(vector) => vector.nearest.validate(),
+            Query::Recommend(recommend) => recommend.recommend.validate(),
+            Query::Discover(discover) => discover.discover.validate(),
+            Query::Context(context) => context.context.validate(),
+            Query::Fusion(fusion) => fusion.fusion.validate(),
+            Query::OrderBy(order_by) => order_by.order_by.validate(),
         }
     }
 }

@@ -9,7 +9,7 @@ use parking_lot::RwLock;
 use segment::common::operation_error::OperationError;
 use segment::data_types::named_vectors::NamedVectors;
 use segment::data_types::query_context::QueryContext;
-use segment::data_types::vectors::{QueryVector, VectorStruct};
+use segment::data_types::vectors::{QueryVector, VectorStructInternal};
 use segment::types::{
     Filter, Indexes, PointIdType, ScoredPoint, SearchParams, SegmentConfig, SeqNumberType,
     WithPayload, WithPayloadInterface, WithVector,
@@ -340,13 +340,14 @@ impl SegmentsSearcher {
     /// - if vector is enabled, vector will be fetched
     ///
     /// The points ids can contain duplicates, the records will be fetched only once
-    /// and returned in the same order as the input points.
+    ///
+    /// If an id is not found in the segments, it won't be included in the output.
     pub fn retrieve(
         segments: &RwLock<SegmentHolder>,
         points: &[PointIdType],
         with_payload: &WithPayload,
         with_vector: &WithVector,
-    ) -> CollectionResult<Vec<Record>> {
+    ) -> CollectionResult<HashMap<PointIdType, Record>> {
         let mut point_version: HashMap<PointIdType, SeqNumberType> = Default::default();
         let mut point_records: HashMap<PointIdType, Record> = Default::default();
 
@@ -370,7 +371,7 @@ impl SegmentsSearcher {
                             None
                         },
                         vector: {
-                            let vector: Option<VectorStruct> = match with_vector {
+                            let vector: Option<VectorStructInternal> = match with_vector {
                                 WithVector::Bool(true) => Some(segment.all_vectors(id)?.into()),
                                 WithVector::Bool(false) => None,
                                 WithVector::Selector(vector_names) => {
@@ -386,6 +387,7 @@ impl SegmentsSearcher {
                             vector.map(Into::into)
                         },
                         shard_key: None,
+                        order_value: None,
                     },
                 );
                 point_version.insert(id, version);
@@ -393,13 +395,7 @@ impl SegmentsSearcher {
             Ok(true)
         })?;
 
-        // Restore the order the ids came in
-        let ordered_records = points
-            .iter()
-            .filter_map(|point| point_records.get(point).cloned())
-            .collect();
-
-        Ok(ordered_records)
+        Ok(point_records)
     }
 }
 
@@ -619,6 +615,7 @@ fn get_hnsw_ef_construct(config: &SegmentConfig, vector_name: &str) -> Option<us
 mod tests {
     use std::collections::HashSet;
 
+    use api::rest::SearchRequestInternal;
     use segment::fixtures::index_fixtures::random_vector;
     use segment::index::VectorIndexEnum;
     use segment::types::{Condition, HasIdCondition};
@@ -626,7 +623,7 @@ mod tests {
 
     use super::*;
     use crate::collection_manager::fixtures::{build_test_holder, random_segment};
-    use crate::operations::types::{CoreSearchRequest, SearchRequestInternal};
+    use crate::operations::types::CoreSearchRequest;
     use crate::optimizers_builder::DEFAULT_INDEXING_THRESHOLD_KB;
 
     #[test]

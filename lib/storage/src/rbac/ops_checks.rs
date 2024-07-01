@@ -2,14 +2,14 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::mem::take;
 
+use api::rest::LookupLocation;
 use collection::grouping::group_by::{GroupRequest, SourceRequest};
 use collection::lookup::WithLookup;
 use collection::operations::payload_ops::{DeletePayloadOp, PayloadOps, SetPayloadOp};
 use collection::operations::point_ops::{PointIdsList, PointOperations};
 use collection::operations::types::{
     ContextExamplePair, CoreSearchRequest, CountRequestInternal, DiscoverRequestInternal,
-    LookupLocation, PointRequestInternal, RecommendExample, RecommendRequestInternal,
-    ScrollRequestInternal,
+    PointRequestInternal, RecommendExample, RecommendRequestInternal, ScrollRequestInternal,
 };
 use collection::operations::universal_query::collection_query::{
     CollectionPrefetch, CollectionQueryRequest, Query, VectorInput, VectorQuery,
@@ -333,7 +333,7 @@ impl CheckableCollectionOperation for CollectionQueryRequest {
             view.check_vector_query(vector_query)?
         }
 
-        // TODO(universal-query): implement lookup_from
+        access.check_lookup_from(&self.lookup_from)?;
 
         for prefetch_query in self.prefetch.iter_mut() {
             check_access_for_prefetch(prefetch_query, &view, access)?;
@@ -346,7 +346,7 @@ impl CheckableCollectionOperation for CollectionQueryRequest {
 fn check_access_for_prefetch(
     prefetch: &mut CollectionPrefetch,
     view: &CollectionAccessView<'_>,
-    _access: &CollectionAccessList, // TODO(universal_query): implement lookup_from
+    access: &CollectionAccessList,
 ) -> Result<(), StorageError> {
     view.apply_filter(&mut prefetch.filter);
 
@@ -354,11 +354,11 @@ fn check_access_for_prefetch(
         view.check_vector_query(vector_query)?
     }
 
-    // TODO(universal-query): implement lookup_from
+    access.check_lookup_from(&prefetch.lookup_from)?;
 
     // Recurse inner prefetches
     for prefetch_query in prefetch.prefetch.iter_mut() {
-        check_access_for_prefetch(prefetch_query, view, _access)?;
+        check_access_for_prefetch(prefetch_query, view, access)?;
     }
 
     Ok(())
@@ -612,14 +612,17 @@ mod tests {
 mod tests_ops {
     use std::fmt::Debug;
 
-    use api::rest::{BatchVectorStruct, OrderByInterface, RecommendStrategy, VectorStruct};
+    use api::rest::{
+        self, BatchVectorStruct, LookupLocation, OrderByInterface, RecommendStrategy,
+        SearchRequestInternal, VectorStruct,
+    };
     use collection::operations::payload_ops::PayloadOpsDiscriminants;
     use collection::operations::point_ops::{
         Batch, PointInsertOperationsInternal, PointInsertOperationsInternalDiscriminants,
         PointOperationsDiscriminants, PointStruct, PointSyncOperation,
     };
     use collection::operations::query_enum::QueryEnum;
-    use collection::operations::types::{SearchRequestInternal, UsingVector};
+    use collection::operations::types::UsingVector;
     use collection::operations::vector_ops::{
         PointVectors, UpdateVectorsOp, VectorOperationsDiscriminants,
     };
@@ -865,7 +868,7 @@ mod tests_ops {
         let op = GroupRequest {
             // NOTE: SourceRequest::Recommend is already tested in test_recommend_request_internal
             source: SourceRequest::Search(SearchRequestInternal {
-                vector: NamedVectorStruct::Default(vec![0.0, 1.0, 2.0]).into(),
+                vector: rest::NamedVectorStruct::Default(vec![0.0, 1.0, 2.0]),
                 filter: None,
                 params: Some(SearchParams::default()),
                 limit: 100,

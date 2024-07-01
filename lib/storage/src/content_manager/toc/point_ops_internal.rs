@@ -1,27 +1,27 @@
 //! Methods here are for distributed internal use only.
 
+use std::time::Duration;
+
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
-use collection::operations::universal_query::shard_query::ShardQueryRequest;
-use segment::types::ScoredPoint;
+use collection::operations::universal_query::shard_query::{ShardQueryRequest, ShardQueryResponse};
 
 use super::TableOfContent;
 use crate::content_manager::errors::StorageError;
 
 impl TableOfContent {
-    pub async fn query_internal(
+    pub async fn query_batch_internal(
         &self,
         collection_name: &str,
-        _request: ShardQueryRequest,
-        _shard_selection: ShardSelectorInternal, // TODO(universal-query): pass this to collection
-    ) -> Result<Vec<Vec<ScoredPoint>>, StorageError> {
-        let _collection = self.get_collection_unchecked(collection_name).await?;
+        requests: Vec<ShardQueryRequest>,
+        shard_selection: ShardSelectorInternal,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<ShardQueryResponse>, StorageError> {
+        let collection = self.get_collection_unchecked(collection_name).await?;
 
-        // TODO(universal-query): implement query_internal in collection
-        // collection
-        //     .query(request, read_consistency, &shard_selection)
-        //     .await
-        //     .map_err(|err| err.into())
+        let res = collection
+            .query_batch_internal(requests, &shard_selection, timeout)
+            .await?;
 
-        todo!()
+        Ok(res)
     }
 }

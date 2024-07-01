@@ -7,139 +7,137 @@ use api::rest::OrderByInterface;
 use futures::future::BoxFuture;
 use futures::FutureExt;
 use segment::common::reciprocal_rank_fusion::rrf_scoring;
-use segment::types::{
-    Filter, HasIdCondition, PointIdType, ScoredPoint, WithPayload, WithPayloadInterface, WithVector,
-};
+use segment::types::{Filter, HasIdCondition, ScoredPoint, WithPayloadInterface, WithVector};
 use tokio::runtime::Handle;
 
 use super::LocalShard;
 use crate::collection_manager::segments_searcher::SegmentsSearcher;
 use crate::operations::types::{
     CollectionError, CollectionResult, CoreSearchRequest, CoreSearchRequestBatch,
-    ScrollRequestInternal,
+    QueryScrollRequestInternal,
 };
 use crate::operations::universal_query::planned_query::{
-    MergePlan, PlannedQuery, PrefetchSource, ResultsMerge,
+    MergePlan, PlannedQuery, RescoreParams, Source,
 };
 use crate::operations::universal_query::shard_query::{Fusion, ScoringQuery, ShardQueryResponse};
 
-struct PrefetchHolder {
-    core_results: Vec<Vec<ScoredPoint>>,
-    scrolls: Vec<Vec<ScoredPoint>>,
+pub enum FetchedSource {
+    Search(usize),
+    Scroll(usize),
 }
 
-impl PrefetchHolder {
-    fn new(core_results: Vec<Vec<ScoredPoint>>, scrolls: Vec<Vec<ScoredPoint>>) -> Self {
+struct PrefetchResults {
+    search_results: Vec<Vec<ScoredPoint>>,
+    scroll_results: Vec<Vec<ScoredPoint>>,
+}
+
+impl PrefetchResults {
+    fn new(search_results: Vec<Vec<ScoredPoint>>, scroll_results: Vec<Vec<ScoredPoint>>) -> Self {
         Self {
-            core_results,
-            scrolls,
+            search_results,
+            scroll_results,
         }
     }
 
-    /// Returns an iterator by Cow over the sources in no specific order.
-    fn iter_sources(
-        &self,
-        core_indices: Vec<usize>,
-        scroll_indices: Vec<usize>,
-        merged_list: Vec<Vec<ScoredPoint>>,
-    ) -> PrefetchIterator {
-        PrefetchIterator {
-            prefetch_holder: self,
-            core_indices,
-            scroll_indices,
-            merged_list,
+    fn get(&self, element: FetchedSource) -> CollectionResult<Cow<'_, Vec<ScoredPoint>>> {
+        match element {
+            FetchedSource::Search(idx) => self.search_results.get(idx).map(Cow::Borrowed),
+            FetchedSource::Scroll(idx) => self.scroll_results.get(idx).map(Cow::Borrowed),
         }
-    }
-}
-
-struct PrefetchIterator<'a> {
-    prefetch_holder: &'a PrefetchHolder,
-    core_indices: Vec<usize>,
-    scroll_indices: Vec<usize>,
-    merged_list: Vec<Vec<ScoredPoint>>,
-}
-
-impl<'a> Iterator for PrefetchIterator<'a> {
-    type Item = Cow<'a, Vec<ScoredPoint>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(idx) = self.core_indices.pop() {
-            return self
-                .prefetch_holder
-                .core_results
-                .get(idx)
-                .map(Cow::Borrowed);
-        }
-        if let Some(idx) = self.scroll_indices.pop() {
-            return self.prefetch_holder.scrolls.get(idx).map(Cow::Borrowed);
-        }
-        self.merged_list.pop().map(Cow::Owned)
+        .ok_or_else(|| CollectionError::service_error("Expected a prefetched source to exist"))
     }
 }
 
 impl LocalShard {
-    #[allow(unreachable_code, clippy::diverging_sub_expression, unused_variables)]
     pub async fn do_planned_query(
         &self,
         request: PlannedQuery,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
-    ) -> CollectionResult<ShardQueryResponse> {
-        let core_results = self
-            .do_search(request.searches, search_runtime_handle, timeout)
-            .await?;
+    ) -> CollectionResult<Vec<ShardQueryResponse>> {
+        let start_time = std::time::Instant::now();
+        let timeout = timeout.unwrap_or(self.shared_storage_config.search_timeout);
 
-        let scrolls = self
-            .query_scroll_batch(request.scrolls, search_runtime_handle)
-            .await?;
+        let searches_f = self.do_search(
+            Arc::new(CoreSearchRequestBatch {
+                searches: request.searches,
+            }),
+            search_runtime_handle,
+            Some(timeout),
+        );
 
-        let prefetch_holder = PrefetchHolder::new(core_results, scrolls);
+        let scrolls_f =
+            self.query_scroll_batch(Arc::new(request.scrolls), search_runtime_handle, timeout);
 
-        let mut scored_points = self
-            .recurse_prefetch(
-                request.merge_plan,
+        // execute both searches and scrolls concurrently
+        let (search_results, scroll_results) = tokio::try_join!(searches_f, scrolls_f)?;
+        let prefetch_holder = PrefetchResults::new(search_results, scroll_results);
+
+        // decrease timeout by the time spent so far
+        let timeout = timeout.saturating_sub(start_time.elapsed());
+
+        let merge_futures = request.root_plans.into_iter().map(|merge_plan| {
+            self.recurse_prefetch(
+                merge_plan,
                 &prefetch_holder,
                 search_runtime_handle,
                 timeout,
-                0, // initial depth
+                0,
             )
-            .await?;
+        });
 
-        // fetch payload and/or vector for scored points if necessary
-        if request.with_payload.is_required() || request.with_vector.is_enabled() {
-            // ids to retrieve (deduplication happens in the searcher)
-            let point_ids = scored_points
-                .iter()
-                .flatten()
-                .map(|scored_point| scored_point.id)
-                .collect::<Vec<PointIdType>>();
+        let batched_scored_points = futures::future::try_join_all(merge_futures).await?;
 
-            // it might make sense to change this approach to fetch payload and vector at the collection level
-            // after the shard results merge, but it requires careful benchmarking
-            let mut records = SegmentsSearcher::retrieve(
-                self.segments(),
-                &point_ids,
-                &WithPayload::from(&request.with_payload),
-                &request.with_vector,
-            )?;
+        Ok(batched_scored_points)
+    }
 
-            // update scored points in place
-            for (scored_point, record) in scored_points.iter_mut().flatten().zip(records.iter_mut())
-            {
-                scored_point.payload = record.payload.take();
-                scored_point.vector = record.vector.take();
-            }
+    /// Fetches the payload and/or vector if required. This will filter out points if they are deleted between search and retrieve.
+    async fn fill_with_payload_or_vectors(
+        &self,
+        query_response: Vec<ScoredPoint>,
+        with_payload: WithPayloadInterface,
+        with_vector: WithVector,
+    ) -> CollectionResult<Vec<ScoredPoint>> {
+        if !with_payload.is_required() && !with_vector.is_enabled() {
+            return Ok(query_response);
         }
 
-        Ok(scored_points)
+        // ids to retrieve (deduplication happens in the searcher)
+        let point_ids: Vec<_> = query_response
+            .iter()
+            .map(|scored_point| scored_point.id)
+            .collect();
+
+        // Collect retrieved records into a hashmap for fast lookup
+        let records_map = SegmentsSearcher::retrieve(
+            self.segments(),
+            &point_ids,
+            &(&with_payload).into(),
+            &with_vector,
+        )?;
+
+        // It might be possible, that we won't find all records,
+        // so we need to re-collect the results
+        let query_response: Vec<_> = query_response
+            .into_iter()
+            .filter_map(|mut point| {
+                records_map.get(&point.id).map(|record| {
+                    point.payload.clone_from(&record.payload);
+                    point.vector.clone_from(&record.vector);
+                    point
+                })
+            })
+            .collect();
+
+        Ok(query_response)
     }
 
     fn recurse_prefetch<'shard, 'query>(
         &'shard self,
         merge_plan: MergePlan,
-        prefetch_holder: &'query PrefetchHolder,
+        prefetch_holder: &'query PrefetchResults,
         search_runtime_handle: &'shard Handle,
-        timeout: Option<Duration>,
+        timeout: Duration,
         depth: usize,
     ) -> BoxFuture<'query, CollectionResult<Vec<Vec<ScoredPoint>>>>
     where
@@ -147,15 +145,18 @@ impl LocalShard {
     {
         async move {
             let max_len = merge_plan.sources.len();
-            let mut search_indices = Vec::with_capacity(max_len);
-            let mut scroll_indices = Vec::with_capacity(max_len);
-            let mut merged_list = Vec::with_capacity(max_len);
+            let mut cow_sources = Vec::with_capacity(max_len);
 
+            // We need to preserve the order of the sources for some fusion strategies
             for source in merge_plan.sources.into_iter() {
                 match source {
-                    PrefetchSource::SearchesIdx(idx) => search_indices.push(idx),
-                    PrefetchSource::ScrollsIdx(idx) => scroll_indices.push(idx),
-                    PrefetchSource::Prefetch(prefetch) => {
+                    Source::SearchesIdx(idx) => {
+                        cow_sources.push(prefetch_holder.get(FetchedSource::Search(idx))?)
+                    }
+                    Source::ScrollsIdx(idx) => {
+                        cow_sources.push(prefetch_holder.get(FetchedSource::Scroll(idx))?)
+                    }
+                    Source::Prefetch(prefetch) => {
                         let merged = self
                             .recurse_prefetch(
                                 prefetch,
@@ -164,120 +165,117 @@ impl LocalShard {
                                 timeout,
                                 depth + 1,
                             )
-                            .await?;
-                        merged_list.extend(merged);
+                            .await?
+                            .into_iter()
+                            .map(Cow::Owned);
+                        cow_sources.extend(merged);
                     }
                 }
             }
 
-            let sources = prefetch_holder.iter_sources(search_indices, scroll_indices, merged_list);
-
-            let root_query_needs_intermediate_results = || {
-                merge_plan
-                    .merge
-                    .as_ref()
-                    .map(|plan| plan.rescore.needs_intermediate_results())
-                    .unwrap_or(false)
-            };
-
-            if depth == 0 && root_query_needs_intermediate_results() {
-                // in case of top level RRF, we need to propagate intermediate results
-                Ok(sources.map(Cow::into_owned).collect())
-            } else {
-                let merged = self
-                    .merge_prefetches(sources, merge_plan.merge, search_runtime_handle, timeout)
+            // Rescore or return plain sources
+            if let Some(rescore_params) = merge_plan.rescore_params {
+                let rescored = self
+                    .rescore(
+                        cow_sources.into_iter(),
+                        rescore_params,
+                        search_runtime_handle,
+                        timeout,
+                    )
                     .await?;
-                Ok(vec![merged])
+
+                Ok(vec![rescored])
+            } else {
+                // The sources here are passed to the next layer without any extra processing.
+                // It is either a query without prefetches, or a fusion request and the intermediate results are passed to the next layer.
+                debug_assert_eq!(depth, 0);
+                // TODO(universal-query): maybe there's a way to pass ownership of the prefetch_holder to avoid cloning with Cow::into_owned here
+                Ok(cow_sources.into_iter().map(Cow::into_owned).collect())
             }
         }
         .boxed()
     }
 
     /// Rescore list of scored points
-    #[allow(clippy::too_many_arguments)]
     async fn rescore<'a>(
         &self,
         sources: impl Iterator<Item = Cow<'a, Vec<ScoredPoint>>>,
-        merge: ResultsMerge,
+        rescore_params: RescoreParams,
         search_runtime_handle: &Handle,
-        timeout: Option<Duration>,
+        timeout: Duration,
     ) -> CollectionResult<Vec<ScoredPoint>> {
-        let ResultsMerge {
+        let RescoreParams {
             rescore,
-            filter,
+            offset,
             score_threshold,
             limit,
-        } = merge;
+            with_vector,
+            with_payload,
+        } = rescore_params;
 
         match rescore {
             ScoringQuery::Fusion(Fusion::Rrf) => {
                 let sources: Vec<_> = sources.map(Cow::into_owned).collect();
 
-                // TODO(universal-query): Remove this ugly part when we propagate merged filters to leaf queries
-                let valid_ids = if let Some(filter) = filter {
-                    let filter =
-                        filter_with_sources_ids(sources.iter().map(Cow::Borrowed), Some(filter));
-                    Some(self.read_filtered(Some(&filter))?)
+                let top_rrf = rrf_scoring(sources);
+
+                let top_rrf: Vec<_> = if let Some(score_threshold) = score_threshold {
+                    top_rrf
+                        .into_iter()
+                        .take_while(|point| point.score >= score_threshold)
+                        .skip(offset)
+                        .take(limit)
+                        .collect()
                 } else {
-                    None
+                    top_rrf.into_iter().skip(offset).take(limit).collect()
                 };
 
-                let mut top_rrf = rrf_scoring(sources);
+                let filled_top_rrf = self
+                    .fill_with_payload_or_vectors(top_rrf, with_payload, with_vector)
+                    .await?;
 
-                top_rrf = top_rrf
-                    .into_iter()
-                    .filter(|point| {
-                        // TODO(universal-query): Remove this ugly part when we propagate merged filters to leaf queries
-                        valid_ids
-                            .as_ref()
-                            .map(|valid_ids| valid_ids.contains(&point.id))
-                            .unwrap_or(true)
-                    })
-                    .take_while(|point| {
-                        // TODO(universal-query): Refactor this ugly part when we propagate merged filters to leaf queries
-                        score_threshold
-                            .map(|threshold| point.score >= threshold)
-                            .unwrap_or(true)
-                    })
-                    .take(limit)
-                    .collect();
-
-                Ok(top_rrf)
+                Ok(filled_top_rrf)
             }
             ScoringQuery::OrderBy(order_by) => {
                 // create single scroll request for rescoring query
-                let filter = filter_with_sources_ids(sources, filter);
+                let filter = filter_with_sources_ids(sources);
 
-                let scroll_request = ScrollRequestInternal {
-                    offset: None,
-                    limit: Some(limit),
+                // Note: score_threshold is not used in this case, as all results will have same score,
+                // but different order_value
+                let scroll_request = QueryScrollRequestInternal {
+                    offset,
+                    limit,
                     filter: Some(filter),
-                    with_payload: Some(WithPayloadInterface::Bool(false)),
-                    with_vector: WithVector::Bool(false),
+                    with_payload,
+                    with_vector,
                     order_by: Some(OrderByInterface::Struct(order_by)),
                 };
 
-                self.query_scroll_batch(Arc::new(vec![scroll_request]), search_runtime_handle)
-                    .await?
-                    .pop()
-                    .ok_or_else(|| {
-                        CollectionError::service_error(
-                            "Rescoring with order-by query didn't return expected batch of results",
-                        )
-                    })
+                self.query_scroll_batch(
+                    Arc::new(vec![scroll_request]),
+                    search_runtime_handle,
+                    timeout,
+                )
+                .await?
+                .pop()
+                .ok_or_else(|| {
+                    CollectionError::service_error(
+                        "Rescoring with order-by query didn't return expected batch of results",
+                    )
+                })
             }
             ScoringQuery::Vector(query_enum) => {
                 // create single search request for rescoring query
-                let filter = filter_with_sources_ids(sources, filter);
+                let filter = filter_with_sources_ids(sources);
 
                 let search_request = CoreSearchRequest {
                     query: query_enum,
                     filter: Some(filter),
                     params: None,
                     limit,
-                    offset: 0,
-                    with_payload: None, // the payload is fetched separately
-                    with_vector: None,  // the vector is fetched separately
+                    offset,
+                    with_payload: Some(with_payload),
+                    with_vector: Some(with_vector),
                     score_threshold,
                 };
 
@@ -288,7 +286,7 @@ impl LocalShard {
                 self.do_search(
                     Arc::new(rescoring_core_search_request),
                     search_runtime_handle,
-                    timeout,
+                    Some(timeout),
                 )
                 .await?
                 // One search request is sent. We expect only one result
@@ -301,40 +299,10 @@ impl LocalShard {
             }
         }
     }
-
-    /// Merge multiple prefetches into a single result up to the limit.
-    /// Rescores if required.
-    async fn merge_prefetches<'a>(
-        &self,
-        mut sources: impl Iterator<Item = Cow<'a, Vec<ScoredPoint>>>,
-        merge: Option<ResultsMerge>,
-        search_runtime_handle: &Handle,
-        timeout: Option<Duration>,
-    ) -> CollectionResult<Vec<ScoredPoint>> {
-        if let Some(results_merge) = merge {
-            self.rescore(sources, results_merge, search_runtime_handle, timeout)
-                .await
-        } else {
-            // The whole query request has no prefetches, and everything comes directly from a single source
-            let top = sources
-                .next()
-                .ok_or_else(|| {
-                    CollectionError::service_error("No sources to merge in the query request")
-                })?
-                .into_owned();
-
-            debug_assert!(sources.next().is_none());
-
-            Ok(top)
-        }
-    }
 }
 
-/// Extracts point ids from sources, creates a filter and merges it with the provided filter.
-fn filter_with_sources_ids<'a>(
-    sources: impl Iterator<Item = Cow<'a, Vec<ScoredPoint>>>,
-    filter: Option<Filter>,
-) -> Filter {
+/// Extracts point ids from sources, and creates a filter to only include those ids.
+fn filter_with_sources_ids<'a>(sources: impl Iterator<Item = Cow<'a, Vec<ScoredPoint>>>) -> Filter {
     let mut point_ids = HashSet::new();
 
     for source in sources {
@@ -344,9 +312,7 @@ fn filter_with_sources_ids<'a>(
     }
 
     // create filter for target point ids
-    let ids_filter = Filter::new_must(segment::types::Condition::HasId(HasIdCondition::from(
+    Filter::new_must(segment::types::Condition::HasId(HasIdCondition::from(
         point_ids,
-    )));
-
-    filter.unwrap_or_default().merge_owned(ids_filter)
+    )))
 }

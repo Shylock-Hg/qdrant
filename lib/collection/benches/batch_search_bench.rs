@@ -1,19 +1,21 @@
 use std::sync::Arc;
 
+use api::rest::SearchRequestInternal;
 use collection::config::{CollectionConfig, CollectionParams, WalConfig};
 use collection::operations::point_ops::{
     PointInsertOperationsInternal, PointOperations, PointStruct,
 };
-use collection::operations::types::{CoreSearchRequestBatch, SearchRequestInternal};
+use collection::operations::types::CoreSearchRequestBatch;
 use collection::operations::vector_params_builder::VectorParamsBuilder;
 use collection::operations::CollectionUpdateOperations;
 use collection::optimizers_builder::OptimizersConfig;
+use collection::save_on_disk::SaveOnDisk;
 use collection::shards::local_shard::LocalShard;
 use collection::shards::shard_trait::ShardOperation;
 use common::cpu::CpuBudget;
 use criterion::{criterion_group, criterion_main, Criterion};
 use rand::thread_rng;
-use segment::data_types::vectors::{only_default_vector, VectorStruct};
+use segment::data_types::vectors::{only_default_vector, VectorStructInternal};
 use segment::fixtures::payload_fixtures::random_vector;
 use segment::types::{Condition, Distance, FieldCondition, Filter, Payload, Range};
 use serde_json::Map;
@@ -36,7 +38,7 @@ fn create_rnd_batch() -> CollectionUpdateOperations {
         let vectors = only_default_vector(&vector);
         let point = PointStruct {
             id: (i as u64).into(),
-            vector: VectorStruct::from(vectors).into(),
+            vector: VectorStructInternal::from(vectors).into(),
             payload: Some(Payload(payload_map)),
         };
         points.push(point);
@@ -85,6 +87,11 @@ fn batch_search_bench(c: &mut Criterion) {
 
     let shared_config = Arc::new(RwLock::new(collection_config));
 
+    let payload_index_schema_dir = Builder::new().prefix("qdrant-test").tempdir().unwrap();
+    let payload_index_schema_file = payload_index_schema_dir.path().join("payload-schema.json");
+    let payload_index_schema =
+        Arc::new(SaveOnDisk::load_or_init_default(payload_index_schema_file).unwrap());
+
     let shard = handle
         .block_on(LocalShard::build_local(
             0,
@@ -92,6 +99,7 @@ fn batch_search_bench(c: &mut Criterion) {
             storage_dir.path(),
             shared_config,
             Default::default(),
+            payload_index_schema,
             handle.clone(),
             CpuBudget::default(),
             optimizers_config,

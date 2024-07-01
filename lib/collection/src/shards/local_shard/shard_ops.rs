@@ -15,7 +15,7 @@ use crate::operations::types::{
     CountRequestInternal, CountResult, PointRequestInternal, Record, UpdateResult, UpdateStatus,
 };
 use crate::operations::universal_query::planned_query::PlannedQuery;
-use crate::operations::universal_query::shard_query::ShardQueryRequest;
+use crate::operations::universal_query::shard_query::{ShardQueryRequest, ShardQueryResponse};
 use crate::operations::OperationWithClockTag;
 use crate::shards::local_shard::LocalShard;
 use crate::shards::shard_trait::ShardOperation;
@@ -139,11 +139,13 @@ impl ShardOperation for LocalShard {
                     .await?;
 
                 records.iter_mut().zip(values).for_each(|(record, value)| {
+                    // TODO(1.11): stop inserting the value in the payload, only use the order_value
                     // Add order_by value to the payload. It will be removed in the next step, after crossing the shard boundary.
                     let new_payload =
                         OrderBy::insert_order_value_in_payload(record.payload.take(), value);
 
                     record.payload = Some(new_payload);
+                    record.order_value = Some(value);
                 });
 
                 Ok(records)
@@ -182,19 +184,27 @@ impl ShardOperation for LocalShard {
         with_payload: &WithPayload,
         with_vector: &WithVector,
     ) -> CollectionResult<Vec<Record>> {
-        SegmentsSearcher::retrieve(self.segments(), &request.ids, with_payload, with_vector)
+        let records_map =
+            SegmentsSearcher::retrieve(self.segments(), &request.ids, with_payload, with_vector)?;
+
+        let ordered_records = request
+            .ids
+            .iter()
+            .filter_map(|point| records_map.get(point).cloned())
+            .collect();
+
+        Ok(ordered_records)
     }
 
-    async fn query(
+    async fn query_batch(
         &self,
-        request: Arc<ShardQueryRequest>,
+        requests: Arc<Vec<ShardQueryRequest>>,
         search_runtime_handle: &Handle,
-    ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
-        self.do_planned_query(
-            PlannedQuery::try_from(request.as_ref().to_owned())?,
-            search_runtime_handle,
-            None,
-        )
-        .await
+        timeout: Option<Duration>,
+    ) -> CollectionResult<Vec<ShardQueryResponse>> {
+        let planned_query = PlannedQuery::try_from(requests.as_ref().to_owned())?;
+
+        self.do_planned_query(planned_query, search_runtime_handle, timeout)
+            .await
     }
 }

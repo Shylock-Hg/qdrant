@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use futures::{future, TryFutureExt};
 use itertools::{Either, Itertools};
-use segment::data_types::vectors::VectorStruct;
+use segment::data_types::vectors::VectorStructInternal;
 use segment::types::{
     ExtendedPointId, Filter, Order, ScoredPoint, WithPayloadInterface, WithVector,
 };
@@ -125,11 +125,25 @@ impl Collection {
 
     async fn do_core_search_batch(
         &self,
-        request: CoreSearchRequestBatch,
+        mut request: CoreSearchRequestBatch,
         read_consistency: Option<ReadConsistency>,
         shard_selection: &ShardSelectorInternal,
         timeout: Option<Duration>,
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
+        if let Some(resharding_filter) = self.shards_holder.read().await.resharding_filter() {
+            for search in &mut request.searches {
+                match &mut search.filter {
+                    Some(filter) => {
+                        *filter = filter.merge(&resharding_filter);
+                    }
+
+                    None => {
+                        search.filter = Some(resharding_filter.clone());
+                    }
+                }
+            }
+        }
+
         let request = Arc::new(request);
 
         let instant = Instant::now();
@@ -219,7 +233,7 @@ impl Collection {
                 // So we just filter out them.
                 records_map.remove(&scored_point.id).map(|record| {
                     scored_point.payload = record.payload;
-                    scored_point.vector = record.vector.map(VectorStruct::from);
+                    scored_point.vector = record.vector.map(VectorStructInternal::from);
                     scored_point
                 })
             })

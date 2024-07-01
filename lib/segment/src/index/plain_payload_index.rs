@@ -1,11 +1,9 @@
 use std::collections::HashMap;
 use std::fs::create_dir_all;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use atomic_refcell::AtomicRefCell;
-use common::cpu::CpuPermit;
 use common::types::{PointOffsetType, ScoredPointOffset, TelemetryDetail};
 use parking_lot::Mutex;
 use schemars::_serde_json::Value;
@@ -322,15 +320,6 @@ impl VectorIndex for PlainIndex {
         }
     }
 
-    fn build_index_with_progress(
-        &mut self,
-        _permit: Arc<CpuPermit>,
-        _stopped: &AtomicBool,
-        _tick_progress: impl FnMut(),
-    ) -> OperationResult<()> {
-        Ok(())
-    }
-
     fn get_telemetry_data(&self, detail: TelemetryDetail) -> VectorIndexSearchesTelemetry {
         VectorIndexSearchesTelemetry {
             index_name: None,
@@ -360,7 +349,26 @@ impl VectorIndex for PlainIndex {
         0
     }
 
-    fn update_vector(&mut self, _id: PointOffsetType, _vector: VectorRef) -> OperationResult<()> {
+    fn update_vector(
+        &mut self,
+        id: PointOffsetType,
+        vector: Option<VectorRef>,
+    ) -> OperationResult<()> {
+        let mut vector_storage = self.vector_storage.borrow_mut();
+
+        if let Some(vector) = vector {
+            vector_storage.insert_vector(id, vector)?;
+        } else {
+            if id as usize >= vector_storage.total_vector_count() {
+                debug_assert!(id as usize == vector_storage.total_vector_count());
+                // Vector doesn't exist in the storage
+                // Insert default vector to keep the sequence
+                let default_vector = vector_storage.default_vector();
+                vector_storage.insert_vector(id, VectorRef::from(&default_vector))?;
+            }
+            vector_storage.delete_vector(id)?;
+        }
+
         Ok(())
     }
 }

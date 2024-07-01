@@ -21,6 +21,7 @@ use super::shard::{PeerId, ShardId};
 use super::transfer::ShardTransferConsensus;
 use crate::common::stoppable_task_async::{spawn_async_cancellable, CancellableAsyncTaskHandle};
 use crate::config::CollectionConfig;
+use crate::operations::shared_storage_config::SharedStorageConfig;
 use crate::shards::channel_service::ChannelService;
 use crate::shards::shard_holder::LockedShardHolder;
 use crate::shards::CollectionId;
@@ -33,6 +34,7 @@ pub struct ReshardState {
     pub peer_id: PeerId,
     pub shard_id: ShardId,
     pub shard_key: Option<ShardKey>,
+    pub stage: ReshardStage,
 }
 
 impl ReshardState {
@@ -41,6 +43,7 @@ impl ReshardState {
             peer_id,
             shard_id,
             shard_key,
+            stage: ReshardStage::MigratingPoints,
         }
     }
 
@@ -57,6 +60,15 @@ impl ReshardState {
             shard_key: self.shard_key.clone(),
         }
     }
+}
+
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReshardStage {
+    #[default]
+    MigratingPoints,
+    ReadHashRingCommitted,
+    WriteHashRingCommitted,
 }
 
 /// Unique identifier of a resharding task
@@ -83,6 +95,7 @@ pub fn spawn_resharding_task<T, F>(
     collection_id: CollectionId,
     collection_path: PathBuf,
     collection_config: Arc<RwLock<CollectionConfig>>,
+    shared_storage_config: Arc<SharedStorageConfig>,
     channel_service: ChannelService,
     temp_dir: PathBuf,
     on_finish: T,
@@ -114,6 +127,7 @@ where
                     collection_id.clone(),
                     collection_path.clone(),
                     collection_config.clone(),
+                    &shared_storage_config,
                     channel_service.clone(),
                     &temp_dir,
                 )

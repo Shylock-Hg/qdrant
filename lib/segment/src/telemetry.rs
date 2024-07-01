@@ -9,11 +9,6 @@ use crate::types::{
 };
 
 #[derive(Serialize, Clone, Debug, JsonSchema)]
-pub struct VectorIndexesTelemetry {
-    vector_index_searches: Vec<VectorIndexSearchesTelemetry>,
-}
-
-#[derive(Serialize, Clone, Debug, JsonSchema)]
 pub struct SegmentTelemetry {
     pub info: SegmentInfo,
     pub config: SegmentConfig,
@@ -137,7 +132,7 @@ impl Anonymize for VectorDataConfig {
             storage_type: self.storage_type,
             index: self.index.clone(),
             quantization_config: self.quantization_config.clone(),
-            multivec_config: self.multivec_config,
+            multivector_config: self.multivector_config,
             datatype: self.datatype,
         }
     }

@@ -13,7 +13,7 @@ tracing = ["dep:tracing", "api/tracing", "collection/tracing", "segment/tracing"
 
 [dev-dependencies]
 tempfile = "3.10.1"
-proptest = "1.4.0"
+proptest = "1.5.0"
 env_logger = "0.11"
 
 [dependencies]
@@ -52,7 +52,7 @@ api = { path = "../api" }
 futures = { workspace = true }
 anyhow = "1.0.86"
 uuid = { workspace = true }
-url = "2.5.1"
+url = "2.5.2"
 reqwest = { workspace = true }
 tempfile = "3.10.1"
 async-trait = "0.1.80"

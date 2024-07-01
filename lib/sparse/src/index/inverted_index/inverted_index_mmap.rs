@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use common::types::PointOffsetType;
 use io::file_operations::{atomic_save_json, read_json};
+use io::storage_version::StorageVersion;
 use memmap2::{Mmap, MmapMut};
 use memory::madvise;
 use memory::mmap_ops::{
@@ -24,6 +25,14 @@ use crate::index::posting_list_common::PostingElementEx;
 const POSTING_HEADER_SIZE: usize = size_of::<PostingListFileHeader>();
 const INDEX_CONFIG_FILE_NAME: &str = "inverted_index_config.json";
 
+pub struct Version;
+
+impl StorageVersion for Version {
+    fn current_raw() -> &'static str {
+        "0.1.0"
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct InvertedIndexFileHeader {
     pub posting_count: usize, // number oof posting lists
@@ -31,6 +40,7 @@ pub struct InvertedIndexFileHeader {
 }
 
 /// Inverted flatten index from dimension id to posting list
+#[derive(Debug)]
 pub struct InvertedIndexMmap {
     path: PathBuf,
     mmap: Arc<Mmap>,
@@ -46,12 +56,22 @@ struct PostingListFileHeader {
 impl InvertedIndex for InvertedIndexMmap {
     type Iter<'a> = PostingListIterator<'a>;
 
+    type Version = Version;
+
     fn open(path: &Path) -> std::io::Result<Self> {
         Self::load(path)
     }
 
     fn save(&self, path: &Path) -> std::io::Result<()> {
         debug_assert_eq!(path, self.path);
+
+        // If Self instance exists, it's either constructed by using `open()` (which reads index
+        // files), or using `from_ram_index()` (which writes them). Both assume that the files
+        // exist. If any of the files are missing, then something went wrong.
+        for file in Self::files(path) {
+            debug_assert!(file.exists());
+        }
+
         Ok(())
     }
 
@@ -74,7 +94,16 @@ impl InvertedIndex for InvertedIndexMmap {
         ]
     }
 
-    fn upsert(&mut self, _id: PointOffsetType, _vector: RemappedSparseVector) {
+    fn remove(&mut self, _id: PointOffsetType, _old_vector: RemappedSparseVector) {
+        panic!("Cannot remove from a read-only Mmap inverted index")
+    }
+
+    fn upsert(
+        &mut self,
+        _id: PointOffsetType,
+        _vector: RemappedSparseVector,
+        _old_vector: Option<RemappedSparseVector>,
+    ) {
         panic!("Cannot upsert into a read-only Mmap inverted index")
     }
 

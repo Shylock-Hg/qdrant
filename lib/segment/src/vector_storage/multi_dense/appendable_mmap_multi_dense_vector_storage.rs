@@ -6,13 +6,11 @@ use std::sync::atomic::AtomicBool;
 use bitvec::prelude::BitSlice;
 use common::types::PointOffsetType;
 
-use crate::common::operation_error::{check_process_stopped, OperationResult};
+use crate::common::operation_error::{check_process_stopped, OperationError, OperationResult};
 use crate::common::Flusher;
 use crate::data_types::named_vectors::{CowMultiVector, CowVector};
 use crate::data_types::primitive::PrimitiveVectorElement;
-use crate::data_types::vectors::{
-    TypedMultiDenseVector, TypedMultiDenseVectorRef, VectorElementType, VectorRef,
-};
+use crate::data_types::vectors::{TypedMultiDenseVectorRef, VectorElementType, VectorRef};
 use crate::types::{Distance, MultiVectorConfig, VectorStorageDatatype};
 use crate::vector_storage::chunked_mmap_vectors::ChunkedMmapVectors;
 use crate::vector_storage::dense::dynamic_mmap_flags::DynamicMmapFlags;
@@ -202,14 +200,9 @@ impl<T: PrimitiveVectorElement> VectorStorage for AppendableMmapMultiDenseVector
     }
 
     fn get_vector_opt(&self, key: PointOffsetType) -> Option<CowVector> {
-        // TODO(colbert) borrow instead of clone
-        self.get_multi_opt(key).map(|multivector| {
-            let multivector = TypedMultiDenseVector {
-                flattened_vectors: multivector.flattened_vectors.to_vec(),
-                dim: multivector.dim,
-            };
-            CowVector::MultiDense(T::into_float_multivector(CowMultiVector::Owned(
-                multivector,
+        self.get_multi_opt(key).map(|multi_dense_vector| {
+            CowVector::MultiDense(T::into_float_multivector(CowMultiVector::Borrowed(
+                multi_dense_vector,
             )))
         })
     }
@@ -219,6 +212,11 @@ impl<T: PrimitiveVectorElement> VectorStorage for AppendableMmapMultiDenseVector
         let multi_vector = T::from_float_multivector(CowMultiVector::Borrowed(multi_vector));
         let multi_vector = multi_vector.as_vec_ref();
         assert_eq!(multi_vector.dim, self.vectors.dim());
+        let multivector_size_in_bytes = std::mem::size_of_val(multi_vector.flattened_vectors);
+        let chunk_size = self.vectors.get_chunk_size_in_bytes();
+        if multivector_size_in_bytes >= chunk_size {
+            return Err(OperationError::service_error(format!("Cannot insert multi vector of size {multivector_size_in_bytes} to the mmap vector storage. It's too large, maximum size is {chunk_size}.")));
+        }
 
         let mut offset = self
             .offsets

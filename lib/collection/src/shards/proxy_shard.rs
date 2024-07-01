@@ -248,13 +248,15 @@ impl ShardOperation for ProxyShard {
     }
 
     /// Forward read-only `query` to `wrapped_shard`
-    async fn query(
+    async fn query_batch(
         &self,
-        request: Arc<ShardQueryRequest>,
+        request: Arc<Vec<ShardQueryRequest>>,
         search_runtime_handle: &Handle,
-    ) -> CollectionResult<ShardQueryResponse> {
-        self.wrapped_shard
-            .query(request, search_runtime_handle)
+        timeout: Option<Duration>,
+    ) -> CollectionResult<Vec<ShardQueryResponse>> {
+        let local_shard = &self.wrapped_shard;
+        local_shard
+            .query_batch(request, search_runtime_handle, timeout)
             .await
     }
 }

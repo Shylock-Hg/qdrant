@@ -8,7 +8,7 @@ use segment::types::*;
 use super::ShardReplicaSet;
 use crate::operations::consistency_params::ReadConsistency;
 use crate::operations::types::*;
-use crate::operations::universal_query::shard_query::ShardQueryRequest;
+use crate::operations::universal_query::shard_query::{ShardQueryRequest, ShardQueryResponse};
 
 impl ShardReplicaSet {
     #[allow(clippy::too_many_arguments)]
@@ -138,18 +138,19 @@ impl ShardReplicaSet {
         }
     }
 
-    pub async fn query(
+    pub async fn query_batch(
         &self,
-        request: Arc<ShardQueryRequest>,
+        requests: Arc<Vec<ShardQueryRequest>>,
         read_consistency: Option<ReadConsistency>,
         local_only: bool,
-    ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
+        timeout: Option<Duration>,
+    ) -> CollectionResult<Vec<ShardQueryResponse>> {
         self.execute_and_resolve_read_operation(
             |shard| {
-                let request = Arc::clone(&request);
+                let requests = Arc::clone(&requests);
                 let search_runtime = self.search_runtime.clone();
 
-                async move { shard.query(request, &search_runtime).await }.boxed()
+                async move { shard.query_batch(requests, &search_runtime, timeout).await }.boxed()
             },
             read_consistency,
             local_only,

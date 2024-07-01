@@ -48,11 +48,12 @@ pub trait ShardOperation {
         with_vector: &WithVector,
     ) -> CollectionResult<Vec<Record>>;
 
-    async fn query(
+    async fn query_batch(
         &self,
-        request: Arc<ShardQueryRequest>,
+        requests: Arc<Vec<ShardQueryRequest>>,
         search_runtime_handle: &Handle,
-    ) -> CollectionResult<ShardQueryResponse>;
+        timeout: Option<Duration>,
+    ) -> CollectionResult<Vec<ShardQueryResponse>>;
 }
 
 pub type ShardOperationSS = dyn ShardOperation + Send + Sync;

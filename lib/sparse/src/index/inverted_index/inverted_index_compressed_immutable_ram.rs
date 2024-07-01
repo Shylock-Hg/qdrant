@@ -3,7 +3,7 @@ use std::path::Path;
 
 use common::types::PointOffsetType;
 
-use super::inverted_index_compressed_mmap::InvertedIndexMmap;
+use super::inverted_index_compressed_mmap::InvertedIndexCompressedMmap;
 use super::inverted_index_ram::InvertedIndexRam;
 use super::InvertedIndex;
 use crate::common::sparse_vector::RemappedSparseVector;
@@ -14,23 +14,25 @@ use crate::index::compressed_posting_list::{
 use crate::index::posting_list_common::PostingListIter as _;
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct InvertedIndexImmutableRam<W> {
+pub struct InvertedIndexCompressedImmutableRam<W: Weight> {
     pub(super) postings: Vec<CompressedPostingList<W>>,
     pub(super) vector_count: usize,
 }
 
-impl<W: Weight> InvertedIndexImmutableRam<W> {
+impl<W: Weight> InvertedIndexCompressedImmutableRam<W> {
     pub(super) fn into_postings(self) -> Vec<CompressedPostingList<W>> {
         self.postings
     }
 }
 
-impl<W: Weight> InvertedIndex for InvertedIndexImmutableRam<W> {
+impl<W: Weight> InvertedIndex for InvertedIndexCompressedImmutableRam<W> {
     type Iter<'a> = CompressedPostingListIterator<'a, W>;
 
+    type Version = <InvertedIndexCompressedMmap<W> as InvertedIndex>::Version;
+
     fn open(path: &Path) -> std::io::Result<Self> {
-        let mmap_inverted_index = InvertedIndexMmap::load(path)?;
-        let mut inverted_index = InvertedIndexImmutableRam {
+        let mmap_inverted_index = InvertedIndexCompressedMmap::load(path)?;
+        let mut inverted_index = InvertedIndexCompressedImmutableRam {
             postings: Vec::with_capacity(mmap_inverted_index.file_header.posting_count),
             vector_count: mmap_inverted_index.file_header.vector_count,
         };
@@ -49,7 +51,7 @@ impl<W: Weight> InvertedIndex for InvertedIndexImmutableRam<W> {
     }
 
     fn save(&self, path: &Path) -> std::io::Result<()> {
-        InvertedIndexMmap::convert_and_save(self, path)?;
+        InvertedIndexCompressedMmap::convert_and_save(self, path)?;
         Ok(())
     }
 
@@ -68,10 +70,19 @@ impl<W: Weight> InvertedIndex for InvertedIndexImmutableRam<W> {
     }
 
     fn files(path: &Path) -> Vec<std::path::PathBuf> {
-        InvertedIndexMmap::<W>::files(path)
+        InvertedIndexCompressedMmap::<W>::files(path)
     }
 
-    fn upsert(&mut self, _id: PointOffsetType, _vector: RemappedSparseVector) {
+    fn remove(&mut self, _id: PointOffsetType, _old_vector: RemappedSparseVector) {
+        panic!("Cannot remove from a read-only RAM inverted index")
+    }
+
+    fn upsert(
+        &mut self,
+        _id: PointOffsetType,
+        _vector: RemappedSparseVector,
+        _old_vector: Option<RemappedSparseVector>,
+    ) {
         panic!("Cannot upsert into a read-only RAM inverted index")
     }
 
@@ -83,11 +94,11 @@ impl<W: Weight> InvertedIndex for InvertedIndexImmutableRam<W> {
         for old_posting_list in &ram_index.postings {
             let mut new_posting_list = CompressedPostingBuilder::new();
             for elem in &old_posting_list.elements {
-                new_posting_list.add(elem.record_id, Weight::from_f32(elem.weight));
+                new_posting_list.add(elem.record_id, elem.weight);
             }
             postings.push(new_posting_list.build());
         }
-        Ok(InvertedIndexImmutableRam {
+        Ok(InvertedIndexCompressedImmutableRam {
             postings,
             vector_count: ram_index.vector_count,
         })
@@ -111,6 +122,7 @@ mod tests {
 
     use super::*;
     use crate::common::sparse_vector_fixture::random_sparse_vector;
+    use crate::common::types::QuantizedU8;
     use crate::index::inverted_index::inverted_index_ram_builder::InvertedIndexBuilder;
 
     #[test]
@@ -123,6 +135,8 @@ mod tests {
 
         check_save_load::<f32>(&inverted_index_ram);
         check_save_load::<half::f16>(&inverted_index_ram);
+        check_save_load::<u8>(&inverted_index_ram);
+        check_save_load::<QuantizedU8>(&inverted_index_ram);
     }
 
     #[test]
@@ -137,21 +151,24 @@ mod tests {
 
         check_save_load::<f32>(&inverted_index_ram);
         check_save_load::<half::f16>(&inverted_index_ram);
+        check_save_load::<u8>(&inverted_index_ram);
+        check_save_load::<QuantizedU8>(&inverted_index_ram);
     }
 
     fn check_save_load<W: Weight>(inverted_index_ram: &InvertedIndexRam) {
         let tmp_dir_path = Builder::new().prefix("test_index_dir").tempdir().unwrap();
-        let inverted_index_immutable_ram = InvertedIndexImmutableRam::<W>::from_ram_index(
-            Cow::Borrowed(inverted_index_ram),
-            tmp_dir_path.path(),
-        )
-        .unwrap();
+        let inverted_index_immutable_ram =
+            InvertedIndexCompressedImmutableRam::<W>::from_ram_index(
+                Cow::Borrowed(inverted_index_ram),
+                tmp_dir_path.path(),
+            )
+            .unwrap();
         inverted_index_immutable_ram
             .save(tmp_dir_path.path())
             .unwrap();
 
         let loaded_inverted_index =
-            InvertedIndexImmutableRam::<W>::open(tmp_dir_path.path()).unwrap();
+            InvertedIndexCompressedImmutableRam::<W>::open(tmp_dir_path.path()).unwrap();
         assert_eq!(inverted_index_immutable_ram, loaded_inverted_index);
     }
 }

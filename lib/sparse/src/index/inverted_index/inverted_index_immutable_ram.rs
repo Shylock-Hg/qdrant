@@ -20,6 +20,8 @@ pub struct InvertedIndexImmutableRam {
 impl InvertedIndex for InvertedIndexImmutableRam {
     type Iter<'a> = PostingListIterator<'a>;
 
+    type Version = <InvertedIndexMmap as InvertedIndex>::Version;
+
     fn open(path: &Path) -> std::io::Result<Self> {
         let mmap_inverted_index = InvertedIndexMmap::load(path)?;
         let mut inverted_index = InvertedIndexRam {
@@ -65,7 +67,16 @@ impl InvertedIndex for InvertedIndexImmutableRam {
         InvertedIndexMmap::files(path)
     }
 
-    fn upsert(&mut self, _id: PointOffsetType, _vector: RemappedSparseVector) {
+    fn remove(&mut self, _id: PointOffsetType, _old_vector: RemappedSparseVector) {
+        panic!("Cannot remove from a read-only RAM inverted index")
+    }
+
+    fn upsert(
+        &mut self,
+        _id: PointOffsetType,
+        _vector: RemappedSparseVector,
+        _old_vector: Option<RemappedSparseVector>,
+    ) {
         panic!("Cannot upsert into a read-only RAM inverted index")
     }
 

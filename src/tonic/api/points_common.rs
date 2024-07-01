@@ -9,11 +9,12 @@ use api::grpc::qdrant::{
     CountResponse, CreateFieldIndexCollection, DeleteFieldIndexCollection, DeletePayloadPoints,
     DeletePointVectors, DeletePoints, DiscoverBatchResponse, DiscoverPoints, DiscoverResponse,
     FieldType, GetPoints, GetResponse, PayloadIndexParams, PointsOperationResponseInternal,
-    PointsSelector, ReadConsistency as ReadConsistencyGrpc, RecommendBatchResponse,
-    RecommendGroupsResponse, RecommendPointGroups, RecommendPoints, RecommendResponse,
-    ScrollPoints, ScrollResponse, SearchBatchResponse, SearchGroupsResponse, SearchPointGroups,
-    SearchPoints, SearchResponse, SetPayloadPoints, SyncPoints, UpdateBatchPoints,
-    UpdateBatchResponse, UpdatePointVectors, UpsertPoints,
+    PointsSelector, QueryBatchResponse, QueryPoints, QueryResponse,
+    ReadConsistency as ReadConsistencyGrpc, RecommendBatchResponse, RecommendGroupsResponse,
+    RecommendPointGroups, RecommendPoints, RecommendResponse, ScrollPoints, ScrollResponse,
+    SearchBatchResponse, SearchGroupsResponse, SearchPointGroups, SearchPoints, SearchResponse,
+    SetPayloadPoints, SyncPoints, UpdateBatchPoints, UpdateBatchResponse, UpdatePointVectors,
+    UpsertPoints,
 };
 use api::rest::{OrderByInterface, ShardKeySelector};
 use collection::operations::consistency_params::ReadConsistency;
@@ -30,12 +31,13 @@ use collection::operations::types::{
     default_exact_count, CoreSearchRequest, CoreSearchRequestBatch, PointRequestInternal,
     RecommendExample, Record, ScrollRequestInternal,
 };
+use collection::operations::universal_query::collection_query::CollectionQueryRequest;
 use collection::operations::vector_ops::{DeleteVectors, PointVectors, UpdateVectors};
 use collection::operations::{ClockTag, CollectionUpdateOperations, OperationWithClockTag};
 use collection::shards::shard::ShardId;
 use itertools::Itertools;
 use segment::data_types::order_by::OrderBy;
-use segment::data_types::vectors::VectorStruct;
+use segment::data_types::vectors::VectorStructInternal;
 use segment::types::{
     ExtendedPointId, Filter, PayloadFieldSchema, PayloadSchemaParams, PayloadSchemaType,
 };
@@ -48,8 +50,9 @@ use tonic::{Response, Status};
 use crate::common::points::{
     do_clear_payload, do_core_search_points, do_count_points, do_create_index,
     do_create_index_internal, do_delete_index, do_delete_index_internal, do_delete_payload,
-    do_delete_points, do_delete_vectors, do_get_points, do_overwrite_payload, do_scroll_points,
-    do_search_batch_points, do_set_payload, do_update_vectors, do_upsert_points, CreateFieldIndex,
+    do_delete_points, do_delete_vectors, do_get_points, do_overwrite_payload,
+    do_query_batch_points, do_query_points, do_scroll_points, do_search_batch_points,
+    do_set_payload, do_update_vectors, do_upsert_points, CreateFieldIndex,
 };
 
 fn extract_points_selector(
@@ -249,7 +252,7 @@ pub async fn update_vectors(
             Some(id) => id.try_into()?,
             None => return Err(Status::invalid_argument("id is expected")),
         };
-        let vector: VectorStruct = match point.vectors {
+        let vector: VectorStructInternal = match point.vectors {
             Some(vectors) => vectors.try_into()?,
             None => return Err(Status::invalid_argument("vectors is expected")),
         };
@@ -1551,6 +1554,87 @@ pub async fn get(
 
     let response = GetResponse {
         result: records.into_iter().map(|point| point.into()).collect(),
+        time: timing.elapsed().as_secs_f64(),
+    };
+
+    Ok(Response::new(response))
+}
+
+pub async fn query(
+    toc: &TableOfContent,
+    query_points: QueryPoints,
+    shard_selection: Option<ShardId>,
+    access: Access,
+) -> Result<Response<QueryResponse>, Status> {
+    let shard_key_selector = query_points.shard_key_selector.clone();
+    let shard_selector = convert_shard_selector_for_read(shard_selection, shard_key_selector);
+    let read_consistency = query_points
+        .read_consistency
+        .clone()
+        .map(TryFrom::try_from)
+        .transpose()?;
+    let timeout = query_points.timeout.map(Duration::from_secs);
+    let collection_name = query_points.collection_name.clone();
+    let request = CollectionQueryRequest::try_from(query_points)?;
+    let timing = Instant::now();
+    let scored_points = do_query_points(
+        toc,
+        &collection_name,
+        request,
+        read_consistency,
+        shard_selector,
+        access,
+        timeout,
+    )
+    .await
+    .map_err(error_to_status)?;
+
+    let response = QueryResponse {
+        result: scored_points
+            .into_iter()
+            .map(|point| point.into())
+            .collect(),
+        time: timing.elapsed().as_secs_f64(),
+    };
+
+    Ok(Response::new(response))
+}
+
+pub async fn query_batch(
+    toc: &TableOfContent,
+    collection_name: String,
+    points: Vec<QueryPoints>,
+    read_consistency: Option<ReadConsistencyGrpc>,
+    access: Access,
+    timeout: Option<Duration>,
+) -> Result<Response<QueryBatchResponse>, Status> {
+    let read_consistency = ReadConsistency::try_from_optional(read_consistency)?;
+    let mut requests = Vec::with_capacity(points.len());
+    for query_points in points {
+        let shard_key_selector = query_points.shard_key_selector.clone();
+        let shard_selector = convert_shard_selector_for_read(None, shard_key_selector);
+        let request = CollectionQueryRequest::try_from(query_points)?;
+        requests.push((request, shard_selector));
+    }
+    let timing = Instant::now();
+    let scored_points = do_query_batch_points(
+        toc,
+        &collection_name,
+        requests,
+        read_consistency,
+        access,
+        timeout,
+    )
+    .await
+    .map_err(error_to_status)?;
+
+    let response = QueryBatchResponse {
+        result: scored_points
+            .into_iter()
+            .map(|points| BatchResult {
+                result: points.into_iter().map(|p| p.into()).collect(),
+            })
+            .collect(),
         time: timing.elapsed().as_secs_f64(),
     };
 

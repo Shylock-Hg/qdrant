@@ -5,7 +5,7 @@ use futures::stream::FuturesUnordered;
 use futures::{future, StreamExt as _, TryFutureExt, TryStreamExt as _};
 use itertools::Itertools;
 use segment::data_types::order_by::{Direction, OrderBy};
-use segment::types::{ShardKey, WithPayload, WithPayloadInterface};
+use segment::types::{Filter, ShardKey, WithPayload, WithPayloadInterface};
 use validator::Validate as _;
 
 use super::Collection;
@@ -207,10 +207,15 @@ impl Collection {
 
     pub async fn scroll_by(
         &self,
-        request: ScrollRequestInternal,
+        mut request: ScrollRequestInternal,
         read_consistency: Option<ReadConsistency>,
         shard_selection: &ShardSelectorInternal,
     ) -> CollectionResult<ScrollResult> {
+        merge_filters(
+            &mut request.filter,
+            self.shards_holder.read().await.resharding_filter(),
+        );
+
         let default_request = ScrollRequestInternal::default();
 
         let id_offset = request.offset;
@@ -225,27 +230,9 @@ impl Collection {
 
         let order_by = request.order_by.map(OrderBy::from);
 
-        // Handle case of order_by
-        if let Some(order_by) = &order_by {
-            // Validate we have a range index for the order_by key
-            let has_range_index_for_order_by_field = self
-                .payload_index_schema
-                .read()
-                .schema
-                .get(&order_by.key)
-                .is_some_and(|field| field.has_range_index());
-
-            if !has_range_index_for_order_by_field {
-                return Err(CollectionError::bad_request(format!(
-                    "No range index for `order_by` key: {}. Please create one to use `order_by`. Integer, float, and datetime payloads can have range indexes, see https://qdrant.tech/documentation/concepts/indexing/#payload-index.",
-                    &order_by.key
-                )));
-            }
-
-            // Validate user did not try to use an id offset with order_by
-            if id_offset.is_some() {
-                return Err(CollectionError::bad_input("Cannot use an `offset` when using `order_by`. The alternative for paging is to use `order_by.start_from` and a filter to exclude the IDs that you've already seen for the `order_by.start_from` value".to_string()));
-            }
+        // Validate user did not try to use an id offset with order_by
+        if order_by.is_some() && id_offset.is_some() {
+            return Err(CollectionError::bad_input("Cannot use an `offset` when using `order_by`. The alternative for paging is to use `order_by.start_from` and a filter to exclude the IDs that you've already seen for the `order_by.start_from` value".to_string()));
         };
 
         if limit == 0 {
@@ -307,14 +294,22 @@ impl Collection {
                 retrieved_iter
                     // Extract and remove order value from payload
                     .map(|records| {
+                        // TODO(1.11): read value only from record.order_value, remove & cleanup this part
                         records.into_iter().map(|mut record| {
                             let value;
                             if local_only {
-                                value =
-                                    order_by.get_order_value_from_payload(record.payload.as_ref());
+                                value = record.order_value.unwrap_or_else(|| {
+                                    order_by.get_order_value_from_payload(record.payload.as_ref())
+                                });
                             } else {
-                                value = order_by
-                                    .remove_order_value_from_payload(record.payload.as_mut());
+                                value = if let Some(order_value) = record.order_value {
+                                    order_by
+                                        .remove_order_value_from_payload(record.payload.as_mut());
+                                    order_value
+                                } else {
+                                    order_by
+                                        .remove_order_value_from_payload(record.payload.as_mut())
+                                };
                                 if !with_payload_interface.is_required() {
                                     // Use None instead of empty hashmap
                                     record.payload = None;
@@ -324,11 +319,13 @@ impl Collection {
                         })
                     })
                     // Get top results
-                    .kmerge_by(|(value_a, _), (value_b, _)| match order_by.direction() {
-                        Direction::Asc => value_a <= value_b,
-                        Direction::Desc => value_a >= value_b,
+                    .kmerge_by(|(value_a, record_a), (value_b, record_b)| {
+                        match order_by.direction() {
+                            Direction::Asc => (value_a, record_a.id) < (value_b, record_b.id),
+                            Direction::Desc => (value_a, record_a.id) > (value_b, record_b.id),
+                        }
                     })
-                    // Add each point only once, deduplicate point IDs
+                    // Only keep the point with the most "valuable" order value
                     .dedup_by(|(_, record_a), (_, record_b)| record_a.id == record_b.id)
                     .map(|(_, record)| api::rest::Record::from(record))
                     .take(limit)
@@ -351,10 +348,15 @@ impl Collection {
 
     pub async fn count(
         &self,
-        request: CountRequestInternal,
+        mut request: CountRequestInternal,
         read_consistency: Option<ReadConsistency>,
         shard_selection: &ShardSelectorInternal,
     ) -> CollectionResult<CountResult> {
+        merge_filters(
+            &mut request.filter,
+            self.shards_holder.read().await.resharding_filter(),
+        );
+
         let shards_holder = self.shards_holder.read().await;
         let shards = shards_holder.select_shards(shard_selection)?;
 
@@ -392,8 +394,16 @@ impl Collection {
             .unwrap_or(&WithPayloadInterface::Bool(false));
         let with_payload = WithPayload::from(with_payload_interface);
         let request = Arc::new(request);
+
+        #[allow(unused_assignments)]
+        let mut resharding_filter = None;
+
         let all_shard_collection_results = {
             let shard_holder = self.shards_holder.read().await;
+
+            // Get resharding filter, while we hold the lock to shard holder
+            resharding_filter = shard_holder.resharding_filter_impl();
+
             let target_shards = shard_holder.select_shards(shard_selection)?;
             let retrieve_futures = target_shards.into_iter().map(|(shard, shard_key)| {
                 let shard_key = shard_key.cloned();
@@ -415,15 +425,32 @@ impl Collection {
                         Ok(records)
                     })
             });
+
             future::try_join_all(retrieve_futures).await?
         };
+
         let mut covered_point_ids = HashSet::new();
         let points = all_shard_collection_results
             .into_iter()
             .flatten()
+            // If resharding is in progress, and *read* hash-ring is committed, filter-out "resharded" points
+            .filter(|point| match &resharding_filter {
+                Some(filter) => filter.check(point.id),
+                None => true,
+            })
             // Add each point only once, deduplicate point IDs
             .filter(|point| covered_point_ids.insert(point.id))
             .collect();
+
         Ok(points)
+    }
+}
+
+fn merge_filters(filter: &mut Option<Filter>, resharding_filter: Option<Filter>) {
+    if let Some(resharding_filter) = resharding_filter {
+        *filter = Some(match filter.take() {
+            Some(filter) => filter.merge_owned(resharding_filter),
+            None => resharding_filter,
+        });
     }
 }

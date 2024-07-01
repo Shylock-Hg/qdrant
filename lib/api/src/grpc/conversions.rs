@@ -10,14 +10,16 @@ use segment::data_types::vectors as segment_vectors;
 use segment::json_path::JsonPath;
 use segment::types::{default_quantization_ignore_value, DateTimePayloadType, FloatPayloadType};
 use segment::vector_storage::query as segment_query;
+use sparse::common::sparse_vector::validate_sparse_vector_impl;
 use tonic::Status;
 use uuid::Uuid;
 
 use super::qdrant::raw_query::RawContextPair;
 use super::qdrant::{
     raw_query, start_from, BinaryQuantization, CompressionRatio, DatetimeRange, Direction,
-    GeoLineString, GroupId, MultiVectorComparator, MultiVectorConfig, OrderBy, OrderValue, Range,
-    RawVector, RecommendStrategy, ShardKeySelector, SparseIndices, StartFrom,
+    GeoLineString, GroupId, LookupLocation, MultiVectorComparator, MultiVectorConfig, OrderBy,
+    OrderValue, Range, RawVector, RecommendStrategy, SearchPointGroups, SearchPoints,
+    ShardKeySelector, SparseIndices, StartFrom, WithLookup,
 };
 use crate::grpc::models::{CollectionsResponse, VersionInfo};
 use crate::grpc::qdrant::condition::ConditionOneOf;
@@ -546,7 +548,7 @@ impl TryFrom<Vector> for segment_vectors::Vector {
                 ));
             }
             let dim = vector.data.len() / vector_count as usize;
-            let multi = segment_vectors::MultiDenseVector::new(vector.data, dim);
+            let multi = segment_vectors::MultiDenseVectorInternal::new(vector.data, dim);
             return Ok(segment_vectors::Vector::MultiDense(multi));
         }
 
@@ -566,21 +568,27 @@ impl From<HashMap<String, segment_vectors::Vector>> for NamedVectors {
     }
 }
 
-impl From<segment_vectors::VectorStruct> for Vectors {
-    fn from(vector_struct: segment_vectors::VectorStruct) -> Self {
+impl From<segment_vectors::VectorStructInternal> for Vectors {
+    fn from(vector_struct: segment_vectors::VectorStructInternal) -> Self {
         match vector_struct {
-            segment_vectors::VectorStruct::Single(vector) => {
-                let vector: segment_vectors::Vector = vector.into();
+            segment_vectors::VectorStructInternal::Single(vector) => {
+                let vector = segment_vectors::Vector::from(vector);
                 Self {
-                    vectors_options: Some(VectorsOptions::Vector(vector.into())),
+                    vectors_options: Some(VectorsOptions::Vector(Vector::from(vector))),
                 }
             }
-            segment_vectors::VectorStruct::Multi(vectors) => Self {
+            segment_vectors::VectorStructInternal::MultiDense(vector) => {
+                let vector = segment_vectors::Vector::from(vector);
+                Self {
+                    vectors_options: Some(VectorsOptions::Vector(Vector::from(vector))),
+                }
+            }
+            segment_vectors::VectorStructInternal::Named(vectors) => Self {
                 vectors_options: Some(VectorsOptions::Vectors(NamedVectors {
                     vectors: HashMap::from_iter(
                         vectors
-                            .iter()
-                            .map(|(name, vector)| (name.clone(), vector.clone().into())),
+                            .into_iter()
+                            .map(|(name, vector)| (name, Vector::from(vector))),
                     ),
                 })),
             },
@@ -673,22 +681,41 @@ impl TryFrom<NamedVectors> for HashMap<String, segment_vectors::Vector> {
     }
 }
 
-impl TryFrom<Vectors> for segment_vectors::VectorStruct {
+impl TryFrom<Vectors> for segment_vectors::VectorStructInternal {
     type Error = Status;
 
     fn try_from(vectors: Vectors) -> Result<Self, Self::Error> {
         match vectors.vectors_options {
             Some(vectors_options) => Ok(match vectors_options {
                 VectorsOptions::Vector(vector) => {
-                    if vector.indices.is_some() {
+                    let Vector {
+                        data,
+                        indices,
+                        vectors_count,
+                    } = vector;
+
+                    if indices.is_some() {
                         return Err(Status::invalid_argument(
                             "Sparse vector must be named".to_string(),
                         ));
                     }
-                    segment_vectors::VectorStruct::Single(vector.data)
+                    if let Some(vectors_count) = vectors_count {
+                        let dim = data.len() / vectors_count as usize;
+
+                        segment_vectors::VectorStructInternal::MultiDense(
+                            segment::data_types::vectors::MultiDenseVectorInternal::try_from_flatten(
+                                data,
+                                dim,
+                            ).map_err(|err| {
+                                Status::invalid_argument(format!("Unable to convert to multi-dense vector: {err}"))
+                            })?,
+                        )
+                    } else {
+                        segment_vectors::VectorStructInternal::Single(data)
+                    }
                 }
                 VectorsOptions::Vectors(vectors) => {
-                    segment_vectors::VectorStruct::Multi(vectors.try_into()?)
+                    segment_vectors::VectorStructInternal::Named(vectors.try_into()?)
                 }
             }),
             None => Err(Status::invalid_argument("No Provided")),
@@ -937,7 +964,11 @@ fn conditions_helper_to_grpc(conditions: Option<Vec<segment::types::Condition>>)
             if conditions.is_empty() {
                 vec![]
             } else {
-                conditions.into_iter().map(|c| c.into()).collect()
+                conditions
+                    .into_iter()
+                    .filter(|c| !c.is_local_only()) // TODO(resharding)!?
+                    .map(|c| c.into())
+                    .collect()
             }
         }
     }
@@ -1034,6 +1065,10 @@ impl From<segment::types::Condition> for Condition {
             segment::types::Condition::Filter(filter) => ConditionOneOf::Filter(filter.into()),
             segment::types::Condition::Nested(nested) => {
                 ConditionOneOf::Nested(nested.nested.into())
+            }
+
+            segment::types::Condition::Resharding(_) => {
+                unimplemented!()
             }
         };
 
@@ -1679,8 +1714,8 @@ impl From<SparseVector> for sparse::common::sparse_vector::SparseVector {
     }
 }
 
-impl From<segment_vectors::MultiDenseVector> for MultiDenseVector {
-    fn from(value: segment_vectors::MultiDenseVector) -> Self {
+impl From<segment_vectors::MultiDenseVectorInternal> for MultiDenseVector {
+    fn from(value: segment_vectors::MultiDenseVectorInternal) -> Self {
         let vectors = value
             .flattened_vectors
             .into_iter()
@@ -1693,8 +1728,8 @@ impl From<segment_vectors::MultiDenseVector> for MultiDenseVector {
     }
 }
 
-impl From<MultiDenseVector> for segment_vectors::MultiDenseVector {
-    /// Uses the equivalent of [new_unchecked()](segment_vectors::MultiDenseVector::new_unchecked), but rewritten to avoid collecting twice
+impl From<MultiDenseVector> for segment_vectors::MultiDenseVectorInternal {
+    /// Uses the equivalent of [new_unchecked()](segment_vectors::MultiDenseVectorInternal::new_unchecked), but rewritten to avoid collecting twice
     fn from(value: MultiDenseVector) -> Self {
         let dim = value.vectors[0].data.len();
         let inner_vector = value
@@ -1745,7 +1780,7 @@ impl TryFrom<RawVector> for segment_vectors::Vector {
                 sparse::common::sparse_vector::SparseVector::from(sparse),
             ),
             Variant::MultiDense(multi_dense) => segment_vectors::Vector::MultiDense(
-                segment_vectors::MultiDenseVector::from(multi_dense),
+                segment_vectors::MultiDenseVectorInternal::from(multi_dense),
             ),
         };
 
@@ -1882,5 +1917,140 @@ impl TryFrom<raw_query::Discovery> for segment_query::DiscoveryQuery<segment_vec
                 .map(segment_query::ContextPair::try_from)
                 .try_collect()?,
         })
+    }
+}
+
+impl TryFrom<SearchPoints> for rest::SearchRequestInternal {
+    type Error = Status;
+
+    fn try_from(value: SearchPoints) -> Result<Self, Self::Error> {
+        let named_struct = crate::grpc::conversions::into_named_vector_struct(
+            value.vector_name,
+            value.vector,
+            value.sparse_indices,
+        )?;
+        let vector = match named_struct {
+            segment_vectors::NamedVectorStruct::Default(v) => rest::NamedVectorStruct::Default(v),
+            segment_vectors::NamedVectorStruct::Dense(v) => rest::NamedVectorStruct::Dense(v),
+            segment_vectors::NamedVectorStruct::Sparse(v) => rest::NamedVectorStruct::Sparse(v),
+            segment_vectors::NamedVectorStruct::MultiDense(_) => {
+                return Err(Status::invalid_argument(
+                    "MultiDense vector is not supported in search request",
+                ))
+            }
+        };
+        Ok(Self {
+            vector,
+            filter: value.filter.map(|f| f.try_into()).transpose()?,
+            params: value.params.map(|p| p.into()),
+            limit: value.limit as usize,
+            offset: value.offset.map(|x| x as usize),
+            with_payload: value.with_payload.map(|wp| wp.try_into()).transpose()?,
+            with_vector: Some(
+                value
+                    .with_vectors
+                    .map(|with_vectors| with_vectors.into())
+                    .unwrap_or_default(),
+            ),
+            score_threshold: value.score_threshold,
+        })
+    }
+}
+
+impl TryFrom<SearchPointGroups> for rest::SearchGroupsRequestInternal {
+    type Error = Status;
+
+    fn try_from(value: SearchPointGroups) -> Result<Self, Self::Error> {
+        let search_points = SearchPoints {
+            vector: value.vector,
+            filter: value.filter,
+            params: value.params,
+            with_payload: value.with_payload,
+            with_vectors: value.with_vectors,
+            score_threshold: value.score_threshold,
+            vector_name: value.vector_name,
+            limit: 0,
+            offset: None,
+            collection_name: String::new(),
+            read_consistency: None,
+            timeout: None,
+            shard_key_selector: None,
+            sparse_indices: value.sparse_indices,
+        };
+
+        if let Some(sparse_indices) = &search_points.sparse_indices {
+            validate_sparse_vector_impl(&sparse_indices.data, &search_points.vector).map_err(
+                |_| {
+                    Status::invalid_argument(
+                        "Sparse indices does not match sparse vector conditions",
+                    )
+                },
+            )?;
+        }
+
+        let rest::SearchRequestInternal {
+            vector,
+            filter,
+            params,
+            limit: _,
+            offset: _,
+            with_payload,
+            with_vector,
+            score_threshold,
+        } = search_points.try_into()?;
+
+        Ok(Self {
+            vector,
+            filter,
+            params,
+            with_payload,
+            with_vector,
+            score_threshold,
+            group_request: rest::BaseGroupRequest {
+                group_by: json_path_from_proto(&value.group_by)?,
+                limit: value.limit,
+                group_size: value.group_size,
+                with_lookup: value
+                    .with_lookup
+                    .map(rest::WithLookupInterface::try_from)
+                    .transpose()?,
+            },
+        })
+    }
+}
+
+impl TryFrom<WithLookup> for rest::WithLookupInterface {
+    type Error = Status;
+
+    fn try_from(value: WithLookup) -> Result<Self, Self::Error> {
+        Ok(Self::WithLookup(value.try_into()?))
+    }
+}
+
+impl TryFrom<WithLookup> for rest::WithLookup {
+    type Error = Status;
+
+    fn try_from(value: WithLookup) -> Result<Self, Self::Error> {
+        let with_default_payload = || Some(segment::types::WithPayloadInterface::Bool(true));
+
+        Ok(Self {
+            collection_name: value.collection,
+            with_payload: value
+                .with_payload
+                .map(|wp| wp.try_into())
+                .transpose()?
+                .or_else(with_default_payload),
+            with_vectors: value.with_vectors.map(|wv| wv.into()),
+        })
+    }
+}
+
+impl From<LookupLocation> for rest::LookupLocation {
+    fn from(value: LookupLocation) -> Self {
+        Self {
+            collection: value.collection_name,
+            vector: value.vector_name,
+            shard_key: value.shard_key_selector.map(rest::ShardKeySelector::from),
+        }
     }
 }

@@ -12,9 +12,12 @@ use segment::types::{
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 
+use super::shard::ShardId;
 use super::update_tracker::UpdateTracker;
 use crate::hash_ring::HashRing;
-use crate::operations::point_ops::{PointOperations, PointStruct, PointSyncOperation};
+use crate::operations::point_ops::{
+    PointInsertOperationsInternal, PointOperations, PointStruct, PointSyncOperation,
+};
 use crate::operations::types::{
     CollectionError, CollectionInfo, CollectionResult, CoreSearchRequestBatch,
     CountRequestInternal, CountResult, PointRequestInternal, Record, UpdateResult, UpdateStatus,
@@ -35,6 +38,7 @@ use crate::shards::telemetry::LocalShardTelemetry;
 /// It can be used to provide all read and write operations while the wrapped shard is being transferred to another node.
 /// Proxy forwards all operations to remote shards.
 pub struct ForwardProxyShard {
+    shard_id: ShardId,
     pub(crate) wrapped_shard: LocalShard,
     pub(crate) remote_shard: RemoteShard,
     /// Lock required to protect transfer-in-progress updates.
@@ -43,8 +47,9 @@ pub struct ForwardProxyShard {
 }
 
 impl ForwardProxyShard {
-    pub fn new(wrapped_shard: LocalShard, remote_shard: RemoteShard) -> Self {
+    pub fn new(shard_id: ShardId, wrapped_shard: LocalShard, remote_shard: RemoteShard) -> Self {
         Self {
+            shard_id,
             wrapped_shard,
             remote_shard,
             update_lock: Mutex::new(()),
@@ -87,6 +92,7 @@ impl ForwardProxyShard {
         offset: Option<PointIdType>,
         batch_size: usize,
         hashring_filter: Option<&HashRing>,
+        merge_points: bool,
         runtime_handle: &Handle,
     ) -> CollectionResult<Option<PointIdType>> {
         debug_assert!(batch_size > 0);
@@ -117,7 +123,7 @@ impl ForwardProxyShard {
             // If using a hashring filter, only transfer points that moved, otherwise transfer all
             .filter(|point| {
                 hashring_filter
-                    .map(|hashring| hashring.has_moved(&point.id))
+                    .map(|hashring| hashring.is_in_shard(&point.id, self.remote_shard.id))
                     .unwrap_or(true)
             })
             .map(|point| point.try_into())
@@ -126,15 +132,18 @@ impl ForwardProxyShard {
         let points = points?;
 
         // Use sync API to leverage potentially existing points
-        let insert_points_operation = {
-            CollectionUpdateOperations::PointOperation(PointOperations::SyncPoints(
-                PointSyncOperation {
-                    from_id: offset,
-                    to_id: next_page_offset,
-                    points,
-                },
-            ))
+        // Normally use SyncPoints, to completely replace everything in the target shard
+        // For resharding we need to merge points from multiple transfers, requiring a different operation
+        let point_operation = if !merge_points {
+            PointOperations::SyncPoints(PointSyncOperation {
+                from_id: offset,
+                to_id: next_page_offset,
+                points,
+            })
+        } else {
+            PointOperations::UpsertPoints(PointInsertOperationsInternal::PointsList(points))
         };
+        let insert_points_operation = CollectionUpdateOperations::PointOperation(point_operation);
 
         // We only need to wait for the last batch.
         let wait = next_page_offset.is_none();
@@ -185,7 +194,7 @@ impl ShardOperation for ForwardProxyShard {
     /// This method is *not* cancel safe.
     async fn update(
         &self,
-        operation: OperationWithClockTag,
+        mut operation: OperationWithClockTag,
         _wait: bool,
     ) -> CollectionResult<UpdateResult> {
         // If we apply `local_shard` update, we *have to* execute `remote_shard` update to completion
@@ -200,6 +209,12 @@ impl ShardOperation for ForwardProxyShard {
         // We always have to wait for the result of the update, cause after we release the lock,
         // the transfer needs to have access to the latest version of points.
         let mut result = self.wrapped_shard.update(operation.clone(), true).await?;
+
+        // Strip clock tag if forwarding to a different shard
+        // Each shard has their own clock tags and they are incompatible with other shards
+        if self.shard_id != self.remote_shard.id {
+            operation.clock_tag = None;
+        }
 
         let remote_result = self
             .remote_shard
@@ -283,12 +298,15 @@ impl ShardOperation for ForwardProxyShard {
             .await
     }
 
-    async fn query(
+    async fn query_batch(
         &self,
-        request: Arc<ShardQueryRequest>,
+        requests: Arc<Vec<ShardQueryRequest>>,
         search_runtime_handle: &Handle,
-    ) -> CollectionResult<ShardQueryResponse> {
+        timeout: Option<Duration>,
+    ) -> CollectionResult<Vec<ShardQueryResponse>> {
         let local_shard = &self.wrapped_shard;
-        local_shard.query(request, search_runtime_handle).await
+        local_shard
+            .query_batch(requests, search_runtime_handle, timeout)
+            .await
     }
 }

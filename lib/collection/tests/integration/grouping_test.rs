@@ -1,9 +1,7 @@
 use collection::collection::Collection;
 use collection::grouping::group_by::{GroupRequest, SourceRequest};
 use collection::operations::point_ops::{Batch, WriteOrdering};
-use collection::operations::types::{
-    RecommendRequestInternal, SearchRequestInternal, UpdateStatus,
-};
+use collection::operations::types::{RecommendRequestInternal, UpdateStatus};
 use collection::operations::CollectionUpdateOperations;
 use itertools::Itertools;
 use rand::distributions::Uniform;
@@ -21,8 +19,9 @@ fn rand_dense_vector(rng: &mut ThreadRng, size: usize) -> DenseVector {
 }
 
 mod group_by {
+    use api::rest::SearchRequestInternal;
     use collection::grouping::GroupBy;
-    use segment::data_types::vectors::BatchVectorStruct;
+    use segment::data_types::vectors::BatchVectorStructInternal;
 
     use super::*;
 
@@ -57,7 +56,7 @@ mod group_by {
         let insert_points = CollectionUpdateOperations::PointOperation(
             Batch {
                 ids: (0..docs * chunks).map(|x| x.into()).collect_vec(),
-                vectors: BatchVectorStruct::from(
+                vectors: BatchVectorStructInternal::from(
                     (0..docs * chunks)
                         .map(|_| rand_dense_vector(&mut rng, 4))
                         .collect_vec(),
@@ -435,10 +434,11 @@ mod group_by {
 /// Tests out the different features working together. The individual features are already tested in other places.
 mod group_by_builder {
 
+    use api::rest::SearchRequestInternal;
     use collection::grouping::GroupBy;
     use collection::lookup::types::PseudoId;
     use collection::lookup::WithLookup;
-    use segment::data_types::vectors::BatchVectorStruct;
+    use segment::data_types::vectors::BatchVectorStructInternal;
     use tokio::sync::RwLock;
 
     use super::*;
@@ -476,7 +476,7 @@ mod group_by_builder {
             let insert_points = CollectionUpdateOperations::PointOperation(
                 Batch {
                     ids: (0..docs * chunks_per_doc).map(|x| x.into()).collect_vec(),
-                    vectors: BatchVectorStruct::from(
+                    vectors: BatchVectorStructInternal::from(
                         (0..docs * chunks_per_doc)
                             .map(|_| rand_dense_vector(&mut rng, 4))
                             .collect_vec(),
@@ -509,7 +509,7 @@ mod group_by_builder {
             let insert_points = CollectionUpdateOperations::PointOperation(
                 Batch {
                     ids: (0..docs).map(|x| x.into()).collect_vec(),
-                    vectors: BatchVectorStruct::from(
+                    vectors: BatchVectorStructInternal::from(
                         (0..docs)
                             .map(|_| rand_dense_vector(&mut rng, 4))
                             .collect_vec(),

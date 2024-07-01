@@ -75,7 +75,7 @@ impl ShardReplicaSet {
             _ => unreachable!(),
         };
 
-        let proxy_shard = ForwardProxyShard::new(local_shard, remote_shard);
+        let proxy_shard = ForwardProxyShard::new(self.shard_id, local_shard, remote_shard);
         let _ = local.insert(Shard::ForwardProxy(proxy_shard));
 
         Ok(())
@@ -333,6 +333,7 @@ impl ShardReplicaSet {
         offset: Option<PointIdType>,
         batch_size: usize,
         hashring_filter: Option<&HashRing>,
+        merge_points: bool,
     ) -> CollectionResult<Option<PointIdType>> {
         let local = self.local.read().await;
 
@@ -344,7 +345,13 @@ impl ShardReplicaSet {
         };
 
         proxy
-            .transfer_batch(offset, batch_size, hashring_filter, &self.search_runtime)
+            .transfer_batch(
+                offset,
+                batch_size,
+                hashring_filter,
+                merge_points,
+                &self.search_runtime,
+            )
             .await
     }
 
@@ -452,7 +459,7 @@ impl ShardReplicaSet {
         };
 
         let (local_shard, remote_shard) = queue_proxy.forget_updates_and_finalize();
-        let forward_proxy = ForwardProxyShard::new(local_shard, remote_shard);
+        let forward_proxy = ForwardProxyShard::new(self.shard_id, local_shard, remote_shard);
         let _ = local.insert(Shard::ForwardProxy(forward_proxy));
 
         Ok(())

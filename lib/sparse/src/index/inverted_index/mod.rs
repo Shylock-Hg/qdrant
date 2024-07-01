@@ -1,7 +1,9 @@
 use std::borrow::Cow;
+use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 
 use common::types::PointOffsetType;
+use io::storage_version::StorageVersion;
 
 use super::posting_list_common::PostingListIter;
 use crate::common::sparse_vector::RemappedSparseVector;
@@ -18,10 +20,12 @@ pub mod inverted_index_ram_builder;
 pub const OLD_INDEX_FILE_NAME: &str = "inverted_index.data";
 pub const INDEX_FILE_NAME: &str = "inverted_index.dat";
 
-pub trait InvertedIndex: Sized {
+pub trait InvertedIndex: Sized + Debug + 'static {
     type Iter<'a>: PostingListIter + Clone
     where
         Self: 'a;
+
+    type Version: StorageVersion;
 
     /// Open existing index based on path
     fn open(path: &Path) -> std::io::Result<Self>;
@@ -46,8 +50,15 @@ pub trait InvertedIndex: Sized {
     /// Files used by this index
     fn files(path: &Path) -> Vec<PathBuf>;
 
+    fn remove(&mut self, id: PointOffsetType, old_vector: RemappedSparseVector);
+
     /// Upsert a vector into the inverted index.
-    fn upsert(&mut self, id: PointOffsetType, vector: RemappedSparseVector);
+    fn upsert(
+        &mut self,
+        id: PointOffsetType,
+        vector: RemappedSparseVector,
+        old_vector: Option<RemappedSparseVector>,
+    );
 
     /// Create inverted index from ram index
     fn from_ram_index<P: AsRef<Path>>(

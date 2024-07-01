@@ -359,7 +359,7 @@ impl CollectionParams {
                         } else {
                             VectorStorageType::Memory
                         },
-                        multivec_config: params.multivec_config,
+                        multivector_config: params.multivector_config,
                         datatype: params.datatype.map(VectorStorageDatatype::from),
                     },
                 )
@@ -375,10 +375,10 @@ impl CollectionParams {
         &self,
     ) -> CollectionResult<HashMap<String, SparseVectorDataConfig>> {
         if let Some(sparse_vectors) = &self.sparse_vectors {
-            Ok(sparse_vectors
+            sparse_vectors
                 .iter()
                 .map(|(name, params)| {
-                    (
+                    Ok((
                         name.into(),
                         SparseVectorDataConfig {
                             index: SparseIndexConfig {
@@ -386,11 +386,15 @@ impl CollectionParams {
                                     .index
                                     .and_then(|index| index.full_scan_threshold),
                                 index_type: SparseIndexType::MutableRam,
+                                datatype: params
+                                    .index
+                                    .and_then(|index| index.datatype)
+                                    .map(VectorStorageDatatype::from),
                             },
                         },
-                    )
+                    ))
                 })
-                .collect())
+                .collect()
         } else {
             Ok(Default::default())
         }

@@ -4,7 +4,7 @@ use common::types::ScoreType;
 use schemars::JsonSchema;
 use segment::common::utils::MaybeOneOrMany;
 use segment::data_types::order_by::OrderBy;
-use segment::json_path::JsonPath;
+use segment::json_path::{JsonPath, JsonPathInterface};
 use segment::types::{Filter, SearchParams, ShardKey, WithPayloadInterface, WithVector};
 use serde::{Deserialize, Serialize};
 use sparse::common::sparse_vector::SparseVector;
@@ -29,7 +29,8 @@ pub enum Vector {
 #[serde(untagged, rename_all = "snake_case")]
 pub enum VectorStruct {
     Single(DenseVector),
-    Multi(HashMap<String, Vector>),
+    MultiDense(MultiDenseVector),
+    Named(HashMap<String, Vector>),
 }
 
 impl VectorStruct {
@@ -37,38 +38,12 @@ impl VectorStruct {
     pub fn is_empty(&self) -> bool {
         match self {
             VectorStruct::Single(vector) => vector.is_empty(),
-            VectorStruct::Multi(vectors) => vectors.values().all(|v| match v {
+            VectorStruct::MultiDense(vector) => vector.is_empty(),
+            VectorStruct::Named(vectors) => vectors.values().all(|v| match v {
                 Vector::Dense(vector) => vector.is_empty(),
                 Vector::Sparse(vector) => vector.indices.is_empty(),
                 Vector::MultiDense(vector) => vector.is_empty(),
             }),
-        }
-    }
-
-    /// TODO(colbert): remove this method and use `merge` from segment::VectorStruct
-    pub fn merge(&mut self, other: Self) {
-        match (self, other) {
-            // If other is empty, merge nothing
-            (_, VectorStruct::Multi(other)) if other.is_empty() => {}
-            // Single overwrites single
-            (VectorStruct::Single(this), VectorStruct::Single(other)) => {
-                *this = other;
-            }
-            // If multi into single, convert this to multi and merge
-            (this @ VectorStruct::Single(_), other @ VectorStruct::Multi(_)) => {
-                let VectorStruct::Single(single) = this.clone() else {
-                    unreachable!();
-                };
-                *this =
-                    VectorStruct::Multi(HashMap::from([(String::new(), Vector::Dense(single))]));
-                this.merge(other);
-            }
-            // Single into multi
-            (VectorStruct::Multi(this), VectorStruct::Single(other)) => {
-                this.insert(String::new(), Vector::Dense(other));
-            }
-            // Multi into multi
-            (VectorStruct::Multi(this), VectorStruct::Multi(other)) => this.extend(other),
         }
     }
 }
@@ -77,7 +52,8 @@ impl VectorStruct {
 #[serde(untagged, rename_all = "snake_case")]
 pub enum BatchVectorStruct {
     Single(Vec<DenseVector>),
-    Multi(HashMap<String, Vec<Vector>>),
+    MultiDense(Vec<MultiDenseVector>),
+    Named(HashMap<String, Vec<Vector>>),
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, JsonSchema, PartialEq)]
@@ -98,13 +74,16 @@ pub struct ScoredPoint {
     /// Points vector distance to the query vector
     pub score: common::types::ScoreType,
     /// Payload - values assigned to the point
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<segment::types::Payload>,
     /// Vector of the point
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vector: Option<VectorStruct>,
     /// Shard Key
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shard_key: Option<segment::types::ShardKey>,
     /// Order-by value
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub order_value: Option<segment::data_types::order_by::OrderValue>,
 }
 
@@ -115,12 +94,16 @@ pub struct Record {
     /// Id of the point
     pub id: segment::types::PointIdType,
     /// Payload - values assigned to the point
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<segment::types::Payload>,
     /// Vector of the point
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vector: Option<VectorStruct>,
     /// Shard Key
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shard_key: Option<segment::types::ShardKey>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order_value: Option<segment::data_types::order_by::OrderValue>,
 }
 
 /// Vector data separator for named and unnamed modes
@@ -155,10 +138,12 @@ pub enum OrderByInterface {
     Struct(OrderBy),
 }
 
+/// Fusion algorithm allows to combine results of multiple prefetches.
+/// Available fusion algorithms:
+/// * `rrf` - Rank Reciprocal Fusion
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Fusion {
-    /// Reciprocal rank fusion
     Rrf,
 }
 
@@ -191,12 +176,14 @@ pub struct QueryRequestInternal {
     pub filter: Option<Filter>,
 
     /// Search params for when there is no prefetch
+    #[validate]
     pub params: Option<SearchParams>,
 
     /// Return points with scores better than this threshold.
     pub score_threshold: Option<ScoreType>,
 
     /// Max number of points to return. Default is 10.
+    #[validate(range(min = 1))]
     pub limit: Option<usize>,
 
     /// Offset of the result. Skip this many points. Default is 0
@@ -207,6 +194,11 @@ pub struct QueryRequestInternal {
 
     /// Options for specifying which payload to include or not. Default is false.
     pub with_payload: Option<WithPayloadInterface>,
+
+    /// The location to use for IDs lookup, if not specified - use the current collection and the 'using' vector
+    /// Note: the other collection vectors should have the same vector size as the 'using' vector in the current collection
+    #[serde(default)]
+    pub lookup_from: Option<LookupLocation>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
@@ -217,6 +209,17 @@ pub struct QueryRequest {
     pub shard_key: Option<ShardKeySelector>,
 }
 
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct QueryRequestBatch {
+    #[validate]
+    pub searches: Vec<QueryRequest>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct QueryResponse {
+    pub points: Vec<ScoredPoint>,
+}
+
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum QueryInterface {
@@ -225,25 +228,61 @@ pub enum QueryInterface {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(untagged)]
 pub enum Query {
     /// Find the nearest neighbors to this vector.
-    Nearest(VectorInput),
+    Nearest(NearestQuery),
 
     /// Use multiple positive and negative vectors to find the results.
-    Recommend(RecommendInput),
+    Recommend(RecommendQuery),
 
     /// Search for nearest points, but constrain the search space with context
-    Discover(DiscoverInput),
+    Discover(DiscoverQuery),
 
     /// Return points that live in positive areas.
-    Context(ContextInput),
+    Context(ContextQuery),
 
     /// Order the points by a payload field.
-    OrderBy(OrderByInterface),
+    OrderBy(OrderByQuery),
 
     /// Fuse the results of multiple prefetches.
-    Fusion(Fusion),
+    Fusion(FusionQuery),
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct NearestQuery {
+    pub nearest: VectorInput,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct RecommendQuery {
+    pub recommend: RecommendInput,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct DiscoverQuery {
+    pub discover: DiscoverInput,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct ContextQuery {
+    pub context: ContextInput,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct OrderByQuery {
+    pub order_by: OrderByInterface,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct FusionQuery {
+    pub fusion: Fusion,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
@@ -266,13 +305,20 @@ pub struct Prefetch {
     pub filter: Option<Filter>,
 
     /// Search params for when there is no prefetch
+    #[validate]
     pub params: Option<SearchParams>,
 
     /// Return points with scores better than this threshold.
     pub score_threshold: Option<ScoreType>,
 
     /// Max number of points to return. Default is 10.
+    #[validate(range(min = 1))]
     pub limit: Option<usize>,
+
+    /// The location to use for IDs lookup, if not specified - use the current collection and the 'using' vector
+    /// Note: the other collection vectors should have the same vector size as the 'using' vector in the current collection
+    #[serde(default)]
+    pub lookup_from: Option<LookupLocation>,
 }
 
 /// How to use positive and negative examples to find the results, default is `average_vector`:
@@ -349,4 +395,136 @@ impl ContextPair {
     pub fn iter(&self) -> impl Iterator<Item = &VectorInput> {
         std::iter::once(&self.positive).chain(std::iter::once(&self.negative))
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct WithLookup {
+    /// Name of the collection to use for points lookup
+    #[serde(rename = "collection")]
+    pub collection_name: String,
+
+    /// Options for specifying which payload to include (or not)
+    #[serde(default = "default_with_payload")]
+    pub with_payload: Option<WithPayloadInterface>,
+
+    /// Options for specifying which vectors to include (or not)
+    #[serde(alias = "with_vector")]
+    #[serde(default)]
+    pub with_vectors: Option<WithVector>,
+}
+
+const fn default_with_payload() -> Option<WithPayloadInterface> {
+    Some(WithPayloadInterface::Bool(true))
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(untagged)]
+pub enum WithLookupInterface {
+    Collection(String),
+    WithLookup(WithLookup),
+}
+
+/// Defines a location to use for looking up the vector.
+/// Specifies collection and vector field name.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct LookupLocation {
+    /// Name of the collection used for lookup
+    pub collection: String,
+    /// Optional name of the vector field within the collection.
+    /// If not provided, the default vector field will be used.
+    #[serde(default)]
+    pub vector: Option<String>,
+
+    /// Specify in which shards to look for the points, if not specified - look in all shards
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_key: Option<ShardKeySelector>,
+}
+
+#[derive(Validate, Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+pub struct BaseGroupRequest {
+    /// Payload field to group by, must be a string or number field.
+    /// If the field contains more than 1 value, all values will be used for grouping.
+    /// One point can be in multiple groups.
+    #[schemars(length(min = 1))]
+    #[validate(custom = "JsonPath::validate_not_empty")]
+    pub group_by: JsonPath,
+
+    /// Maximum amount of points to return per group
+    #[validate(range(min = 1))]
+    pub group_size: u32,
+
+    /// Maximum amount of groups to return
+    #[validate(range(min = 1))]
+    pub limit: u32,
+
+    /// Look for points in another collection using the group ids
+    pub with_lookup: Option<WithLookupInterface>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone)]
+pub struct SearchGroupsRequestInternal {
+    /// Look for vectors closest to this
+    #[validate]
+    pub vector: NamedVectorStruct,
+
+    /// Look only for points which satisfies this conditions
+    #[validate]
+    pub filter: Option<Filter>,
+
+    /// Additional search params
+    #[validate]
+    pub params: Option<SearchParams>,
+
+    /// Select which payload to return with the response. Default is false.
+    pub with_payload: Option<WithPayloadInterface>,
+
+    /// Options for specifying which vectors to include into response. Default is false.
+    #[serde(default, alias = "with_vectors")]
+    pub with_vector: Option<WithVector>,
+
+    /// Define a minimal score threshold for the result.
+    /// If defined, less similar results will not be returned.
+    /// Score of the returned result might be higher or smaller than the threshold depending on the
+    /// Distance function used. E.g. for cosine similarity only higher scores will be returned.
+    pub score_threshold: Option<ScoreType>,
+
+    #[serde(flatten)]
+    #[validate]
+    pub group_request: BaseGroupRequest,
+}
+
+/// Search request.
+/// Holds all conditions and parameters for the search of most similar points by vector similarity
+/// given the filtering restrictions.
+#[derive(Deserialize, Serialize, JsonSchema, Validate, Clone, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct SearchRequestInternal {
+    /// Look for vectors closest to this
+    #[validate]
+    pub vector: NamedVectorStruct,
+    /// Look only for points which satisfies this conditions
+    #[validate]
+    pub filter: Option<Filter>,
+    /// Additional search params
+    #[validate]
+    pub params: Option<SearchParams>,
+    /// Max number of result to return
+    #[serde(alias = "top")]
+    #[validate(range(min = 1))]
+    pub limit: usize,
+    /// Offset of the first result to return.
+    /// May be used to paginate results.
+    /// Note: large offset values may cause performance issues.
+    pub offset: Option<usize>,
+    /// Select which payload to return with the response. Default is false.
+    pub with_payload: Option<WithPayloadInterface>,
+    /// Options for specifying which vectors to include into response. Default is false.
+    #[serde(default, alias = "with_vectors")]
+    pub with_vector: Option<WithVector>,
+    /// Define a minimal score threshold for the result.
+    /// If defined, less similar results will not be returned.
+    /// Score of the returned result might be higher or smaller than the threshold depending on the
+    /// Distance function used. E.g. for cosine similarity only higher scores will be returned.
+    pub score_threshold: Option<ScoreType>,
 }

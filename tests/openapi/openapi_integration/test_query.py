@@ -1,9 +1,12 @@
 from math import isclose
 import pytest
+import requests
+import os
 
 from .helpers.collection_setup import basic_collection_setup, drop_collection
 from .helpers.helpers import reciprocal_rank_fusion, request_with_validation
 
+QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost:6333")
 collection_name = "test_query"
 
 
@@ -22,6 +25,69 @@ def setup(on_disk_vectors):
     drop_collection(collection_name=collection_name)
 
 
+def test_query_validation():
+    response = request_with_validation(
+        api="/collections/{collection_name}/points/query",
+        method="POST",
+        path_params={"collection_name": collection_name},
+        body={
+            "prefetch": [
+                {
+                    "query": {
+                        "recommend": {
+                            "positive": [1]
+                        },
+                    }
+                }
+            ]
+        },
+    )
+    assert not response.ok, response.text
+    assert response.json()["status"]["error"] == ("Bad request: A query is needed to merge the prefetches. Can't have prefetches without defining a query.")
+
+    response = request_with_validation(
+        api="/collections/{collection_name}/points/query",
+        method="POST",
+        path_params={"collection_name": collection_name},
+        body={
+            "score_threshold": 10,
+        },
+    )
+    assert not response.ok, response.text
+    assert response.json()["status"]["error"] == ("Bad request: A query is needed to use the score_threshold. Can't have score_threshold without defining a query.")
+
+    response = request_with_validation(
+        api="/collections/{collection_name}/points/query",
+        method="POST",
+        path_params={"collection_name": collection_name},
+        body={
+            "score_threshold": 10,
+            "query": {
+                "order_by": {
+                    "key": "price",
+                }
+            }
+        },
+    )
+    assert not response.ok, response.text
+    assert response.json()["status"]["error"] == ("Bad request: Can't use score_threshold with an order_by query.")
+
+
+    # raw query to bypass local validation
+    response = requests.post(f"http://{QDRANT_HOST}/collections/{collection_name}/points/query",
+        json={
+            "query": {
+                "recommend": {
+                    "positive": [1]
+                },
+            },
+            "limit": 0,
+        },
+    )
+    assert not response.ok, response.text
+    assert response.json()["status"]["error"] == ("Validation error in JSON body: [internal.limit: value 0 invalid, must be 1.0 or larger]")
+
+
 def root_and_rescored_query(query, limit=None, with_payload=None):
     response = request_with_validation(
         api="/collections/{collection_name}/points/query",
@@ -34,7 +100,7 @@ def root_and_rescored_query(query, limit=None, with_payload=None):
         },
     )
     assert response.ok
-    root_query_result = response.json()["result"]
+    root_query_result = response.json()["result"]["points"]
 
     response = request_with_validation(
         api="/collections/{collection_name}/points/query",
@@ -49,7 +115,7 @@ def root_and_rescored_query(query, limit=None, with_payload=None):
         },
     )
     assert response.ok
-    nested_query_result = response.json()["result"]
+    nested_query_result = response.json()["result"]["points"]
 
     assert root_query_result == nested_query_result
     return root_query_result
@@ -95,7 +161,7 @@ def test_basic_scroll():
         },
     )
     assert response.ok
-    query_result = response.json()["result"]
+    query_result = response.json()["result"]["points"]
 
     for record, scored_point in zip(scroll_result, query_result):
         assert record.get("id") == scored_point.get("id")
@@ -155,7 +221,7 @@ def test_basic_recommend_best_score():
         },
     )
     assert response.ok
-    query_result = response.json()["result"]
+    query_result = response.json()["result"]["points"]
 
     assert recommend_result == query_result
 
@@ -211,7 +277,7 @@ def test_basic_context():
         },
     )
     assert response.ok
-    query_result = response.json()["result"]
+    query_result = response.json()["result"]["points"]
 
     assert set([p["id"] for p in context_result]) == set([p["id"] for p in query_result])
 
@@ -225,7 +291,7 @@ def test_basic_order_by():
             "order_by": "price",
         },
     )
-    assert response.ok
+    assert response.ok, response.text
     scroll_result = response.json()["result"]["points"]
 
     query_result = root_and_rescored_query({"order_by": "price"}, with_payload=True)
@@ -275,7 +341,7 @@ def test_basic_rrf():
         },
     )
     assert response.ok, response.json()
-    rrf_result = response.json()["result"]
+    rrf_result = response.json()["result"]["points"]
     
     def get_id(x):
         return x["id"]
@@ -283,5 +349,5 @@ def test_basic_rrf():
     # rrf order is not deterministic with same scores, so we need to sort by id
     for expected, result in zip(sorted(rrf_expected, key=get_id), sorted(rrf_result, key=get_id)):
         assert expected["id"] == result["id"]
-        assert expected["payload"] == result["payload"]
+        assert expected.get("payload") == result.get("payload")
         assert isclose(expected["score"], result["score"], rel_tol=1e-5)

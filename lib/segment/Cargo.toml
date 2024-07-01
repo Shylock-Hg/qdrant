@@ -26,7 +26,7 @@ rand_distr = "0.4.3"
 walkdir = "2.5.0"
 rstest = "0.21.0"
 segment = { path = ".", features = ["testing"] }
-proptest = "1.4.0"
+proptest = "1.5.0"
 
 [target.'cfg(not(target_os = "windows"))'.dev-dependencies]
 pprof = { workspace = true }
@@ -44,6 +44,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_cbor = { workspace = true }
 serde-value = "0.7"
+serde_variant = "0.1.3"
 serde-untagged = "0.1.6"
 ordered-float = "4.2"
 thiserror = "1.0"
@@ -86,6 +87,7 @@ memory = { path = "../common/memory" }
 sparse = { path = "../sparse" }
 
 tracing = { workspace = true, optional = true }
+fs4 = "0.8.4"
 macro_rules_attribute = "0.2.0"
 generic-tests = { workspace = true }
 nom = "7.1.3"

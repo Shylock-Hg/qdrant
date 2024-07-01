@@ -328,8 +328,16 @@ impl TableOfContent {
                     .await?;
             }
 
-            ReshardingOperation::CommitHashRing(key) => {
-                collection.commit_hashring(key).await?;
+            ReshardingOperation::CommitRead(key) => {
+                collection.commit_read_hashring(key).await?;
+            }
+
+            ReshardingOperation::CommitWrite(key) => {
+                collection.commit_write_hashring(key).await?;
+            }
+
+            ReshardingOperation::Finish(key) => {
+                collection.finish_resharding(key).await?;
             }
 
             ReshardingOperation::Abort(key) => {
@@ -473,11 +481,11 @@ impl TableOfContent {
 
                 let new_transfer = ShardTransfer {
                     shard_id: transfer_restart.shard_id,
+                    to_shard_id: None,
                     from: transfer_restart.from,
                     to: transfer_restart.to,
                     sync: old_transfer.sync, // Preserve sync flag from the old transfer
                     method: Some(transfer_restart.method),
-                    to_shard_id: None,
                 };
 
                 Box::pin(

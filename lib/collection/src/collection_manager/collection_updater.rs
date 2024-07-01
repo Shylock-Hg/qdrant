@@ -72,7 +72,10 @@ impl CollectionUpdater {
 
 #[cfg(test)]
 mod tests {
-    use segment::data_types::vectors::{only_default_vector, VectorStruct, DEFAULT_VECTOR_NAME};
+    use itertools::Itertools;
+    use segment::data_types::vectors::{
+        only_default_vector, VectorStructInternal, DEFAULT_VECTOR_NAME,
+    };
     use segment::types::{Payload, WithPayload};
     use serde_json::json;
     use tempfile::Builder;
@@ -97,27 +100,27 @@ mod tests {
         let points = vec![
             PointStruct {
                 id: 11.into(),
-                vector: VectorStruct::from(vec11).into(),
+                vector: VectorStructInternal::from(vec11).into(),
                 payload: None,
             },
             PointStruct {
                 id: 12.into(),
-                vector: VectorStruct::from(vec12).into(),
+                vector: VectorStructInternal::from(vec12).into(),
                 payload: None,
             },
             PointStruct {
                 id: 13.into(),
-                vector: VectorStruct::from(vec13).into(),
+                vector: VectorStructInternal::from(vec13).into(),
                 payload: Some(json!({ "color": "red" }).into()),
             },
             PointStruct {
                 id: 14.into(),
-                vector: VectorStruct::from(vec![0., 0., 0., 0.]).into(),
+                vector: VectorStructInternal::from(vec![0., 0., 0., 0.]).into(),
                 payload: None,
             },
             PointStruct {
                 id: 500.into(),
-                vector: VectorStruct::from(vec![2., 0., 2., 0.]).into(),
+                vector: VectorStructInternal::from(vec![2., 0., 2., 0.]).into(),
                 payload: None,
             },
         ];
@@ -139,12 +142,12 @@ mod tests {
         let points = vec![
             PointStruct {
                 id: 1.into(),
-                vector: VectorStruct::from(vec![2., 2., 2., 2.]).into(),
+                vector: VectorStructInternal::from(vec![2., 2., 2., 2.]).into(),
                 payload: None,
             },
             PointStruct {
                 id: 500.into(),
-                vector: VectorStruct::from(vec![2., 0., 2., 0.]).into(),
+                vector: VectorStructInternal::from(vec![2., 0., 2., 0.]).into(),
                 payload: None,
             },
         ];
@@ -158,7 +161,9 @@ mod tests {
             &WithPayload::from(true),
             &true.into(),
         )
-        .unwrap();
+        .unwrap()
+        .into_values()
+        .collect_vec();
 
         assert_eq!(records.len(), 3);
 
@@ -190,7 +195,9 @@ mod tests {
             &WithPayload::from(true),
             &true.into(),
         )
-        .unwrap();
+        .unwrap()
+        .into_values()
+        .collect_vec();
 
         for record in records {
             assert!(record.vector.is_some());
@@ -221,7 +228,9 @@ mod tests {
 
         let res =
             SegmentsSearcher::retrieve(&segments, &points, &WithPayload::from(true), &false.into())
-                .unwrap();
+                .unwrap()
+                .into_values()
+                .collect_vec();
 
         assert_eq!(res.len(), 3);
 
@@ -253,7 +262,10 @@ mod tests {
             &WithPayload::from(true),
             &false.into(),
         )
-        .unwrap();
+        .unwrap()
+        .into_values()
+        .collect_vec();
+
         assert_eq!(res.len(), 1);
         assert!(!res[0].payload.as_ref().unwrap().contains_key("color"));
 
@@ -265,7 +277,10 @@ mod tests {
             &WithPayload::from(true),
             &false.into(),
         )
-        .unwrap();
+        .unwrap()
+        .into_values()
+        .collect_vec();
+
         assert_eq!(res.len(), 1);
         assert!(res[0].payload.as_ref().unwrap().contains_key("color"));
 
@@ -283,7 +298,10 @@ mod tests {
             &WithPayload::from(true),
             &false.into(),
         )
-        .unwrap();
+        .unwrap()
+        .into_values()
+        .collect_vec();
+
         assert_eq!(res.len(), 1);
         assert!(!res[0].payload.as_ref().unwrap().contains_key("color"));
     }

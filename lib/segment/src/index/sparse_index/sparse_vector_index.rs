@@ -6,7 +6,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use atomic_refcell::AtomicRefCell;
-use common::cpu::CpuPermit;
 use common::types::{PointOffsetType, ScoredPointOffset, TelemetryDetail};
 use io::storage_version::{StorageVersion as _, VERSION_FILE};
 use itertools::Itertools;
@@ -16,13 +15,13 @@ use sparse::common::sparse_vector::SparseVector;
 use sparse::common::types::DimId;
 use sparse::index::inverted_index::inverted_index_ram_builder::InvertedIndexBuilder;
 use sparse::index::inverted_index::{InvertedIndex, INDEX_FILE_NAME, OLD_INDEX_FILE_NAME};
-use sparse::index::migrate::SparseVectorIndexVersion;
 use sparse::index::search_context::SearchContext;
 
 use super::indices_tracker::IndicesTracker;
 use super::sparse_index_config::SparseIndexType;
 use crate::common::operation_error::{check_process_stopped, OperationError, OperationResult};
 use crate::common::operation_time_statistics::ScopeDurationMeasurer;
+use crate::data_types::named_vectors::CowVector;
 use crate::data_types::query_context::VectorQueryContext;
 use crate::data_types::vectors::{QueryVector, Vector, VectorRef};
 use crate::id_tracker::IdTrackerSS;
@@ -38,6 +37,9 @@ use crate::vector_storage::query::TransformInto;
 use crate::vector_storage::{
     check_deleted_condition, new_stoppable_raw_scorer, VectorStorage, VectorStorageEnum,
 };
+
+/// Whether to use the new compressed format.
+pub const USE_COMPRESSED: bool = true;
 
 pub struct SparseVectorIndex<TInvertedIndex: InvertedIndex> {
     config: SparseIndexConfig,
@@ -79,49 +81,60 @@ impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
     }
 }
 
+pub struct SparseVectorIndexOpenArgs<'a, F: FnMut()> {
+    pub config: SparseIndexConfig,
+    pub id_tracker: Arc<AtomicRefCell<IdTrackerSS>>,
+    pub vector_storage: Arc<AtomicRefCell<VectorStorageEnum>>,
+    pub payload_index: Arc<AtomicRefCell<StructPayloadIndex>>,
+    pub path: &'a Path,
+    pub stopped: &'a AtomicBool,
+    pub tick_progress: F,
+}
+
 impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
     /// Open a sparse vector index at a given path
-    pub fn open(
-        config: SparseIndexConfig,
-        id_tracker: Arc<AtomicRefCell<IdTrackerSS>>,
-        vector_storage: Arc<AtomicRefCell<VectorStorageEnum>>,
-        payload_index: Arc<AtomicRefCell<StructPayloadIndex>>,
-        path: &Path,
-        stopped: &AtomicBool,
-    ) -> OperationResult<Self> {
-        // create directory if it does not exist
-        create_dir_all(path)?;
+    pub fn open<F: FnMut()>(args: SparseVectorIndexOpenArgs<F>) -> OperationResult<Self> {
+        let SparseVectorIndexOpenArgs {
+            config,
+            id_tracker,
+            vector_storage,
+            payload_index,
+            path,
+            stopped,
+            tick_progress,
+        } = args;
 
         let config_path = SparseIndexConfig::get_config_path(path);
 
         let (config, inverted_index, indices_tracker) = if !config.index_type.is_persisted() {
             // RAM mutable case - build inverted index from scratch and use provided config
+            create_dir_all(path)?;
             let (inverted_index, indices_tracker) = Self::build_inverted_index(
                 id_tracker.clone(),
                 vector_storage.clone(),
                 path,
                 stopped,
-                || (),
+                tick_progress,
             )?;
             (config, inverted_index, indices_tracker)
         } else {
             Self::try_load(path).or_else(|e| {
-                // Avoid noisy warning for newly created segments
-                if vector_storage.borrow().total_vector_count() != 0 {
-                    log::warn!("Failed to load, rebuilding: {}", e.to_string());
+                if path.try_exists().unwrap_or(true) {
+                    log::warn!("Failed to load {path:?}, rebuilding: {e}");
+
+                    // Drop index completely.
+                    remove_dir_all(path)?;
                 }
+
+                create_dir_all(path)?;
 
                 let (inverted_index, indices_tracker) = Self::build_inverted_index(
                     id_tracker.clone(),
                     vector_storage.clone(),
                     path,
                     stopped,
-                    || (),
+                    tick_progress,
                 )?;
-
-                // Drop index completely.
-                remove_dir_all(path)?;
-                create_dir_all(path)?;
 
                 config.save(&config_path)?;
                 inverted_index.save(path)?;
@@ -132,11 +145,7 @@ impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
                 // version file. To distinguish between index in original format and partially
                 // written index in the current format, the index file name is changed from
                 // `inverted_index.data` to `inverted_index.dat`.
-                SparseVectorIndexVersion::save(path)?;
-
-                if vector_storage.borrow().total_vector_count() != 0 {
-                    log::info!("Successfully rebuilt");
-                }
+                TInvertedIndex::Version::save(path)?;
 
                 OperationResult::Ok((config, inverted_index, indices_tracker))
             })?
@@ -161,22 +170,20 @@ impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
     fn try_load(
         path: &Path,
     ) -> OperationResult<(SparseIndexConfig, TInvertedIndex, IndicesTracker)> {
-        let mut stored_version = SparseVectorIndexVersion::load(path)?;
+        let mut stored_version = TInvertedIndex::Version::load(path)?;
 
         // Simple migration mechanism for 0.1.0.
-        // TODO: Drop this code on the next version bump.
         let old_path = path.join(OLD_INDEX_FILE_NAME);
-        assert_eq!(SparseVectorIndexVersion::current(), Version::new(0, 1, 0));
-        if stored_version.is_none() && old_path.exists() {
+        if TInvertedIndex::Version::current() == Version::new(0, 1, 0) && old_path.exists() {
             rename(old_path, path.join(INDEX_FILE_NAME))?;
-            SparseVectorIndexVersion::save(path)?;
-            stored_version = Some(SparseVectorIndexVersion::current());
+            TInvertedIndex::Version::save(path)?;
+            stored_version = Some(TInvertedIndex::Version::current());
         }
 
-        if stored_version != Some(SparseVectorIndexVersion::current()) {
+        if stored_version != Some(TInvertedIndex::Version::current()) {
             return Err(OperationError::service_error(format!(
                 "Index version mismatch, expected {}, found {}",
-                SparseVectorIndexVersion::current(),
+                TInvertedIndex::Version::current(),
                 stored_version.map_or_else(|| "none".to_string(), |v| v.to_string()),
             )));
         }
@@ -530,35 +537,6 @@ impl<TInvertedIndex: InvertedIndex> VectorIndex for SparseVectorIndex<TInvertedI
         Ok(results)
     }
 
-    fn build_index_with_progress(
-        &mut self,
-        _permit: Arc<CpuPermit>,
-        stopped: &AtomicBool,
-        tick_progress: impl FnMut(),
-    ) -> OperationResult<()> {
-        let (inverted_index, indices_tracker) = Self::build_inverted_index(
-            self.id_tracker.clone(),
-            self.vector_storage.clone(),
-            &self.path,
-            stopped,
-            tick_progress,
-        )?;
-
-        self.inverted_index = inverted_index;
-        self.indices_tracker = indices_tracker;
-
-        // save inverted index
-        if self.config.index_type.is_persisted() {
-            SparseVectorIndexVersion::save(&self.path)?;
-            self.indices_tracker.save(&self.path)?;
-            self.inverted_index.save(&self.path)?;
-        }
-
-        // save config to mark successful build
-        self.save_config()?;
-        Ok(())
-    }
-
     fn get_telemetry_data(&self, detail: TelemetryDetail) -> VectorIndexSearchesTelemetry {
         self.searches_telemetry.get_telemetry_data(detail)
     }
@@ -584,19 +562,52 @@ impl<TInvertedIndex: InvertedIndex> VectorIndex for SparseVectorIndex<TInvertedI
         self.inverted_index.vector_count()
     }
 
-    fn update_vector(&mut self, id: PointOffsetType, vector: VectorRef) -> OperationResult<()> {
+    fn update_vector(
+        &mut self,
+        id: PointOffsetType,
+        vector: Option<VectorRef>,
+    ) -> OperationResult<()> {
+        let (old_vector, new_vector) = {
+            let mut vector_storage = self.vector_storage.borrow_mut();
+            let old_vector = vector_storage.get_vector_opt(id).map(CowVector::to_owned);
+            let new_vector = if let Some(vector) = vector {
+                vector_storage.insert_vector(id, vector)?;
+                vector.to_owned()
+            } else {
+                let default_vector = vector_storage.default_vector();
+                if id as usize >= vector_storage.total_vector_count() {
+                    // Vector doesn't exist in the storage
+                    // Insert default vector to keep the sequence
+                    vector_storage.insert_vector(id, VectorRef::from(&default_vector))?;
+                }
+                vector_storage.delete_vector(id)?;
+                default_vector
+            };
+            (old_vector, new_vector)
+        };
+
         if self.config.index_type != SparseIndexType::MutableRam {
             return Err(OperationError::service_error(
                 "Cannot update vector in non-appendable index",
             ));
         }
 
-        let vector: &SparseVector = vector.try_into()?;
+        let vector = SparseVector::try_from(new_vector)?;
+        let old_vector: Option<SparseVector> =
+            old_vector.map(SparseVector::try_from).transpose()?;
+
         // do not upsert empty vectors into the index
         if !vector.is_empty() {
-            self.indices_tracker.register_indices(vector);
-            let vector = self.indices_tracker.remap_vector(vector.to_owned());
-            self.inverted_index.upsert(id, vector);
+            self.indices_tracker.register_indices(&vector);
+            let vector = self.indices_tracker.remap_vector(vector);
+            let old_vector = old_vector.map(|v| self.indices_tracker.remap_vector(v));
+            self.inverted_index.upsert(id, vector, old_vector);
+        } else if let Some(old_vector) = old_vector {
+            // Make sure empty vectors do not interfere with the index
+            if !old_vector.is_empty() {
+                let old_vector = self.indices_tracker.remap_vector(old_vector);
+                self.inverted_index.remove(id, old_vector);
+            }
         }
         Ok(())
     }
